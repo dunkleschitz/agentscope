@@ -293,10 +293,229 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.0.0", r.stdout)
+        self.assertIn("1.1.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini"):
             self.assertIn(h, r.stdout)
+
+
+class McpTests(Base):
+    SECRET = "s3cr3t-token-value-xyz"
+
+    def mcp_tool(self, home, *args, **kw):
+        return self.tool(home, "--mcp", *args, **kw)
+
+    def test_claude_all_scopes(self):
+        root, home = self.tree({
+            ".git": None,
+            ".mcp.json": json.dumps({"mcpServers": {
+                "gh": {"command": "gh-mcp", "args": ["--x"]}}}),
+        })
+        with open(os.path.join(home, ".claude.json"), "w") as f:
+            json.dump({"mcpServers": {
+                "stripe": {"url": "https://mcp.stripe.com/mcp"}}},
+                      f)
+        r = self.mcp_tool(home, "--harness", "claude", "--json", root)
+        self.assertEqual(r.returncode, 0)
+        doc = json.loads(r.stdout)
+        self.assertEqual(doc["mode"], "mcp")
+        sv = {s["name"]: s for s in doc["harnesses"][0]["servers"]}
+        self.assertEqual(sv["gh"]["scope"], "project")
+        self.assertEqual(sv["gh"]["transport"], "stdio")
+        self.assertEqual(sv["stripe"]["scope"], "user")
+        self.assertEqual(sv["stripe"]["transport"], "http")
+        self.assertIn("approval", sv["gh"]["note"])
+
+    def test_claude_local_scope_project_key(self):
+        root, home = self.tree({".git": None})
+        with open(os.path.join(home, ".claude.json"), "w") as f:
+            json.dump({"projects": {root: {"mcpServers": {
+                "db": {"command": "db-srv"}}}}}, f)
+        r = self.mcp_tool(home, "--harness", "claude", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("db", r.stdout)
+        self.assertIn("local scope", r.stdout)
+
+    def test_env_values_never_printed(self):
+        root, home = self.tree({
+            ".mcp.json": json.dumps({"mcpServers": {"srv": {
+                "command": "x", "env": {"API_KEY": self.SECRET}}}}),
+        })
+        r = self.mcp_tool(home, "--harness", "claude", root)
+        self.assertNotIn(self.SECRET, r.stdout)
+        self.assertNotIn(self.SECRET, r.stderr)
+        self.assertIn("API_KEY=<set>", r.stdout)
+        r = self.mcp_tool(home, "--harness", "claude", "--json", root)
+        self.assertNotIn(self.SECRET, r.stdout)
+        self.assertNotIn(self.SECRET, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["harnesses"][0]["servers"][0]["env"],
+                         {"API_KEY": "<set>"})
+
+    def test_url_query_and_fragment_masked(self):
+        root, home = self.tree({
+            ".mcp.json": json.dumps({"mcpServers": {"srv": {
+                "url": "https://h.example/mcp?token=%s#frag" % self.SECRET,
+                "headers": {"Authorization": self.SECRET}}}}),
+        })
+        r = self.mcp_tool(home, "--harness", "claude", root)
+        self.assertNotIn(self.SECRET, r.stdout)
+        self.assertIn("https://h.example/mcp", r.stdout)
+        self.assertNotIn("?token=", r.stdout)
+        r2 = self.mcp_tool(home, "--harness", "claude", "--json", root)
+        self.assertNotIn(self.SECRET, r2.stdout)
+        url = json.loads(r2.stdout)["harnesses"][0]["servers"][0]["url"]
+        self.assertEqual(url, "https://h.example/mcp")
+
+    def test_codex_toml_global_and_project(self):
+        root, home = self.tree({".git": None})
+        os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+        with open(os.path.join(home, ".codex", "config.toml"), "w") as f:
+            f.write('[mcp_servers.fs]\ncommand = "fs-srv"\nargs = ["--root", "/"]\n'
+                    '[mcp_servers.remote]\nurl = "https://api.example.com/mcp"\n')
+        os.makedirs(os.path.join(root, ".codex"), exist_ok=True)
+        with open(os.path.join(root, ".codex", "config.toml"), "w") as f:
+            f.write('[mcp_servers.proj]\ncommand = "proj-srv"\n')
+        r = self.mcp_tool(home, "--harness", "codex", "--json", root)
+        self.assertEqual(r.returncode, 0)
+        sv = {s["name"]: s for s in json.loads(r.stdout)["harnesses"][0]["servers"]}
+        self.assertEqual(sv["fs"]["scope"], "global")
+        self.assertEqual(sv["fs"]["args"], ["--root", "/"])
+        self.assertEqual(sv["remote"]["transport"], "http")
+        self.assertEqual(sv["proj"]["scope"], "project")
+
+    def test_codex_project_config_ignored_without_codex_dir(self):
+        root, home = self.tree({".git": None})
+        # stray config.toml outside a .codex/ dir must not load
+        with open(os.path.join(root, "config.toml"), "w") as f:
+            f.write('[mcp_servers.stray]\ncommand = "x"\n')
+        r = self.mcp_tool(home, "--harness", "codex", root)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("(no MCP servers resolve", r.stdout)
+
+    def test_cursor_pair(self):
+        root, home = self.tree({
+            ".git": None,
+            ".cursor/mcp.json": json.dumps({"mcpServers": {
+                "p": {"command": "p-srv"}}}),
+        })
+        os.makedirs(os.path.join(home, ".cursor"), exist_ok=True)
+        with open(os.path.join(home, ".cursor", "mcp.json"), "w") as f:
+            json.dump({"mcpServers": {"g": {"url": "https://g.example/mcp"}}}, f)
+        r = self.mcp_tool(home, "--harness", "cursor", "--json", root)
+        sv = {s["name"]: s for s in json.loads(r.stdout)["harnesses"][0]["servers"]}
+        self.assertEqual(sv["p"]["scope"], "project")
+        self.assertEqual(sv["g"]["scope"], "global")
+        self.assertEqual(sv["g"]["transport"], "http")
+
+    def test_copilot_project_and_global_and_servers_key(self):
+        root, home = self.tree({
+            ".git": None,
+            ".github/mcp.json": json.dumps({"servers": {"p": {"command": "p"}}}),
+        })
+        os.makedirs(os.path.join(home, ".copilot"), exist_ok=True)
+        with open(os.path.join(home, ".copilot", "mcp-config.json"), "w") as f:
+            json.dump({"mcpServers": {"g": {"command": "g"}}}, f)
+        r = self.mcp_tool(home, "--harness", "copilot", "--json", root)
+        sv = {s["name"]: s for s in json.loads(r.stdout)["harnesses"][0]["servers"]}
+        self.assertEqual(sv["p"]["scope"], "project")
+        self.assertEqual(sv["g"]["scope"], "global")
+
+    def test_gemini_pair(self):
+        root, home = self.tree({
+            ".git": None,
+            ".gemini/settings.json": json.dumps({"mcpServers": {
+                "p": {"command": "p"}}}),
+        })
+        os.makedirs(os.path.join(home, ".gemini"), exist_ok=True)
+        with open(os.path.join(home, ".gemini", "settings.json"), "w") as f:
+            json.dump({"mcpServers": {"u": {"command": "u"}}}, f)
+        r = self.mcp_tool(home, "--harness", "gemini", "--json", root)
+        sv = {s["name"]: s for s in json.loads(r.stdout)["harnesses"][0]["servers"]}
+        self.assertEqual(sv["p"]["scope"], "project")
+        self.assertEqual(sv["u"]["scope"], "user")
+
+    def test_name_collision_warning(self):
+        root, home = self.tree({
+            ".git": None,
+            ".gemini/settings.json": json.dumps({"mcpServers": {
+                "dup": {"command": "p"}}}),
+        })
+        os.makedirs(os.path.join(home, ".gemini"), exist_ok=True)
+        with open(os.path.join(home, ".gemini", "settings.json"), "w") as f:
+            json.dump({"mcpServers": {"dup": {"command": "u"}}}, f)
+        r = self.mcp_tool(home, "--harness", "gemini", root)
+        self.assertIn("multiple scopes", r.stdout)
+        self.assertIn("dup", r.stdout)
+
+    def test_malformed_json_does_not_crash(self):
+        root, home = self.tree({".git": None, ".mcp.json": "{not json"})
+        r = self.mcp_tool(home, "--harness", "claude", root)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("WARNING", r.stdout)
+
+    def test_malformed_toml_does_not_crash(self):
+        root, home = self.tree({".git": None})
+        os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+        with open(os.path.join(home, ".codex", "config.toml"), "w") as f:
+            f.write("[mcp_servers\nbroken = = =\n")
+        r = self.mcp_tool(home, "--harness", "codex", root)
+        self.assertIn("WARNING", r.stdout)
+
+    def test_unknown_transport_listed_with_warning(self):
+        root, home = self.tree({
+            ".git": None,
+            ".mcp.json": json.dumps({"mcpServers": {"weird": {"foo": 1}}}),
+        })
+        r = self.mcp_tool(home, "--harness", "claude", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("unknown", r.stdout)
+        self.assertIn("WARNING", r.stdout)
+
+    def test_full_refused_in_mcp_mode(self):
+        root, home = self.tree({})
+        r = self.mcp_tool(home, "--full", root)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("refused", r.stderr)
+
+    def test_exit_1_when_nothing_found(self):
+        root, home = self.tree({".git": None})
+        r = self.mcp_tool(home, root)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("(no MCP servers resolve", r.stdout)
+
+    def test_outline_and_diff(self):
+        root, home = self.tree({
+            ".git": None,
+            ".mcp.json": json.dumps({"mcpServers": {"onlyA": {"command": "a"}}}),
+        })
+        r = self.mcp_tool(home, "--harness", "claude", "--outline", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("onlyA", r.stdout)
+        r = self.mcp_tool(home, "--diff-harness", "claude", "codex", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("onlyA", r.stdout)
+        self.assertIn("MCP servers", r.stdout)
+
+    def test_unknown_harness_exit_2(self):
+        root, home = self.tree({})
+        r = self.mcp_tool(home, "--harness", "bogus", root)
+        self.assertEqual(r.returncode, 2)
+
+    def test_json_shape_and_no_secrets(self):
+        root, home = self.tree({
+            ".git": None,
+            ".mcp.json": json.dumps({"mcpServers": {"s": {
+                "command": "c", "args": ["a"], "env": {"K": self.SECRET}}}}),
+        })
+        r = self.mcp_tool(home, "--harness", "claude", "--json", root)
+        doc = json.loads(r.stdout)
+        s = doc["harnesses"][0]["servers"][0]
+        for k in ("name", "source", "scope", "transport", "command",
+                  "args", "url", "env", "headers", "via", "note"):
+            self.assertIn(k, s)
+        self.assertEqual(s["env"], {"K": "<set>"})
+        self.assertNotIn(self.SECRET, r.stdout)
+        self.assertIn("secret", doc["disclaimer"])
 
 
 if __name__ == "__main__":

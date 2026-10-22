@@ -1,5 +1,23 @@
 # CHANGELOG — agentscope
 
+## 1.1.0 (2026-10-22)
+
+`--mcp` mode: effective MCP server resolution per harness for a
+directory — name, config scope (project/user/local/global), source
+file, transport (stdio with command+args; http for remote, never
+probed), env/header names only. Config layouts per harness verified
+against the Microsoft APM per-harness table 2026-10-22 (Claude
+`.mcp.json` + `~/.claude.json` mcpServers/projects[]; Codex
+`config.toml` `[mcp_servers.*]` global+project; Cursor
+`.cursor/mcp.json` pair; Copilot `.github/mcp.json` +
+`mcp-config.json`; Gemini `settings.json` `mcpServers` pair).
+Secret safety is structural: env/header values never printed, URL
+query strings/fragments stripped, `--full` refused in `--mcp` mode,
+remote servers listed but never probed. Same-name servers in multiple
+scopes surface as warnings (merge order undocumented). `--diff-harness`
+works in both modes. 45 tests (18 new), all green. Requires Python 3.11+
+now (tomllib); README gained an `--mcp` section.
+
 ## 1.0.0 (2026-10-22)
 
 Initial release.

@@ -33,6 +33,12 @@ Harness behavior drifts with releases; when in doubt, check the harness's own
 docs. Truncation is reported as total-bytes vs cap with an ESTIMATED cutoff —
 never a claimed exact drop line, because the true truncation point depends on
 the harness's internal encoding.
+
+v1.1.0 adds --mcp: resolve the EFFECTIVE MCP server set a harness loads for
+a directory (which servers, from which config scope, stdio vs http, env var
+NAMES only). Same honesty model; secret-safety is structural — env/header
+values and URL query strings are NEVER printed, and --full is refused in
+--mcp mode.
 """
 import argparse
 import fnmatch
@@ -41,7 +47,7 @@ import os
 import re
 import sys
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 RULES_VERIFIED = "2026-10-22"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -570,9 +576,349 @@ def resolve_gemini(d):
     return res
 
 
-RESOLVERS = {"codex": resolve_codex, "claude": resolve_claude,
-             "cursor": resolve_cursor, "copilot": resolve_copilot,
-             "gemini": resolve_gemini}
+INSTR_RESOLVERS = {"codex": resolve_codex, "claude": resolve_claude,
+                   "cursor": resolve_cursor, "copilot": resolve_copilot,
+                   "gemini": resolve_gemini}
+
+
+# --------------------------------------------------------------------------
+# MCP server resolution (v1.1.0) — "which MCP servers does harness X
+# actually load for directory Y?"
+# --------------------------------------------------------------------------
+# Same honesty model: a model of DOCUMENTED harness behavior. Config layouts
+# verified against the Microsoft APM "Install MCP servers" per-harness table
+# (2026-10-22). Secret-safety is STRUCTURAL, not documentary:
+#   - env var VALUES and header values are NEVER printed (names only, <set>)
+#   - URL query strings and fragments are stripped (they may carry tokens)
+#   - --full is refused in --mcp mode
+#   - remote (http/sse) servers are listed as REMOTE and never probed
+# Strictly READ-ONLY: never writes, never executes anything, never touches
+# the network.
+
+import tomllib  # stdlib 3.11+; agentscope requires 3.11
+
+
+def mask_url(url):
+    """Strip query string and fragment from a URL (may carry tokens)."""
+    if not isinstance(url, str):
+        return ""
+    return re.sub(r"[?#].*$", "", url)
+
+
+def env_names(mapping):
+    """{NAME: <set>} — names only; values never leave the config file."""
+    if not isinstance(mapping, dict):
+        return {}
+    return {str(k): "<set>" for k in mapping}
+
+
+def read_toml_obj(path):
+    data = read_bytes(path)
+    if data is None:
+        return None
+    try:
+        obj = tomllib.loads(data.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def new_mcp_resolution(harness):
+    return {"harness": harness, "servers": [], "warnings": [], "notes": []}
+
+
+def add_mcp_server(res, name, source, scope, transport, via, command="",
+                   args=None, url="", env=None, headers=None, note=""):
+    srv = {"name": str(name), "source": source, "scope": scope,
+           "transport": transport,  # stdio | http | unknown
+           "command": command or "",
+           "args": [str(a) for a in args] if args else [],
+           "url": mask_url(url) if url else "",
+           "env": env_names(env), "headers": env_names(headers),
+           "via": via, "note": note or ""}
+    res["servers"].append(srv)
+    return srv
+
+
+def mcp_from_json_block(res, block, source, scope, via):
+    """Parse a {name: {...}} server map (mcpServers or servers key)."""
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        res["warnings"].append(
+            "malformed server map in %s (expected an object); skipped" % source)
+        return
+    for name, entry in block.items():
+        if not isinstance(entry, dict):
+            res["warnings"].append(
+                "server %r in %s is not an object; skipped" % (name, source))
+            continue
+        url = entry.get("url") or entry.get("serverUrl")
+        command = entry.get("command")
+        transport = "http" if url else ("stdio" if command else "unknown")
+        srv = add_mcp_server(
+            res, name, source, scope, transport, via, command=command,
+            args=entry.get("args"), url=url, env=entry.get("env"),
+            headers=entry.get("headers"))
+        if transport == "unknown":
+            res["warnings"].append(
+                "server %r in %s has neither url nor command; "
+                "listed as unknown" % (name, source))
+
+
+def mcp_from_toml_block(res, block, source, scope, via):
+    """Parse Codex [mcp_servers.*] tables. [documented] shape; url [inferred]."""
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        res["warnings"].append(
+            "malformed [mcp_servers] in %s (expected a table); skipped" % source)
+        return
+    for name, entry in block.items():
+        if not isinstance(entry, dict):
+            res["warnings"].append(
+                "server %r in %s is not a table; skipped" % (name, source))
+            continue
+        url = entry.get("url")
+        command = entry.get("command")
+        transport = "http" if url else ("stdio" if command else "unknown")
+        add_mcp_server(
+            res, name, source, scope, transport, via, command=command,
+            args=entry.get("args"), url=url, env=entry.get("env"))
+        if transport == "unknown":
+            res["warnings"].append(
+                "server %r in %s has neither url nor command; "
+                "listed as unknown" % (name, source))
+
+
+def mcp_collisions(res, tag):
+    """Same server name defined in >1 scope: surface it, don't silently pick."""
+    seen = {}
+    for s in res["servers"]:
+        seen.setdefault(s["name"], []).append(s["scope"])
+    for name, scopes in seen.items():
+        uniq = sorted(set(scopes))
+        if len(uniq) > 1:
+            res["warnings"].append(
+                "%s server %r is defined in multiple scopes (%s); the "
+                "harness merges them at runtime" % (tag, name, ", ".join(uniq)))
+
+
+def resolve_mcp_claude(d):
+    res = new_mcp_resolution("claude")
+    h = home()
+    ad = os.path.abspath(d)
+    # Project scope. [documented]
+    p = os.path.join(ad, ".mcp.json")
+    obj = read_json_obj(p)
+    if obj is None and os.path.exists(p):
+        res["warnings"].append("%s exists but is unreadable/not JSON" % p)
+    else:
+        mcp_from_json_block(res, obj.get("mcpServers") if obj else None, p,
+                            "project", "[documented] .mcp.json = project scope")
+        for s in res["servers"]:
+            if s["scope"] == "project":
+                s["note"] = ("[documented] project-scoped servers prompt for "
+                             "user approval in interactive sessions")
+    # User + local scopes from ~/.claude.json. [documented] locations.
+    cfg_path = os.path.join(h, ".claude.json")
+    cfg = read_json_obj(cfg_path)
+    if cfg is None and os.path.exists(cfg_path):
+        res["warnings"].append("%s exists but is unreadable/not JSON" % cfg_path)
+    if cfg:
+        mcp_from_json_block(res, cfg.get("mcpServers"), cfg_path, "user",
+                            "[documented] ~/.claude.json mcpServers = user scope")
+        projs = cfg.get("projects")
+        matched = False
+        if isinstance(projs, dict):
+            for cand in (ad, git_root(ad)):
+                if cand and cand in projs and isinstance(projs[cand], dict):
+                    mcp_from_json_block(
+                        res, projs[cand].get("mcpServers"),
+                        "%s [projects %s]" % (cfg_path, cand), "local",
+                        "[documented] per-project local scope lives in "
+                        "~/.claude.json; [inferred] matched by exact "
+                        "project-path key")
+                    matched = True
+                    break
+        if not matched:
+            res["notes"].append(
+                "[inferred] no ~/.claude.json projects[] key matched this "
+                "directory; local-scope servers (if any) are not shown")
+    mcp_collisions(res, "[inferred]")
+    return res
+
+
+def resolve_mcp_codex(d):
+    res = new_mcp_resolution("codex")
+    h = home()
+    ad = os.path.abspath(d)
+    files = [(os.path.join(h, ".codex", "config.toml"), "global",
+              "[documented] ~/.codex/config.toml = global scope")]
+    proj_dir = os.path.join(ad, ".codex")
+    if os.path.isdir(proj_dir):  # [documented] project config only then
+        files.append((os.path.join(proj_dir, "config.toml"), "project",
+                      "[documented] .codex/config.toml = project scope"))
+    else:
+        res["notes"].append(
+            "[documented] no .codex/ dir here, so no project-scope config")
+    for path, scope, via in files:
+        obj = read_toml_obj(path)
+        if obj is None:
+            if os.path.exists(path):
+                res["warnings"].append(
+                    "%s exists but is unreadable/not TOML" % path)
+            continue
+        mcp_from_toml_block(res, obj.get("mcp_servers"), path, scope, via)
+    mcp_collisions(res, "[inferred]")
+    return res
+
+
+def _resolve_mcp_jsonpair(res, d, proj_rel, glob_rel):
+    """Shared pattern: project file (git root) + global file (HOME)."""
+    h = home()
+    root = git_root(os.path.abspath(d)) or os.path.abspath(d)
+    proj_path, proj_scope, proj_via = proj_rel
+    glob_path, glob_scope, glob_via = glob_rel
+    pp = os.path.join(root, proj_path)
+    gp = os.path.join(h, glob_path)
+    for path, scope, via in ((pp, proj_scope, proj_via), (gp, glob_scope, glob_via)):
+        obj = read_json_obj(path)
+        if obj is None:
+            if os.path.exists(path):
+                res["warnings"].append(
+                    "%s exists but is unreadable/not JSON" % path)
+            continue
+        block = obj.get("mcpServers")
+        used_key = "mcpServers"
+        if block is None and obj.get("servers") is not None:
+            block = obj.get("servers")
+            used_key = "servers"
+        key_note = "" if used_key == "mcpServers" else (
+            " ([inferred] accepted 'servers' key here)")
+        mcp_from_json_block(res, block, path, scope, via + key_note)
+    mcp_collisions(res, "[inferred]")
+
+
+def resolve_mcp_cursor(d):
+    res = new_mcp_resolution("cursor")
+    _resolve_mcp_jsonpair(
+        res, d,
+        (os.path.join(".cursor", "mcp.json"), "project",
+         "[documented] .cursor/mcp.json = project scope"),
+        (os.path.join(".cursor", "mcp.json"), "global",
+         "[documented] ~/.cursor/mcp.json = global scope"))
+    return res
+
+
+def resolve_mcp_copilot(d):
+    res = new_mcp_resolution("copilot")
+    h = home()
+    ad = os.path.abspath(d)
+    root = git_root(ad) or ad
+    # Project scope. [documented] file; nearest-up-the-tree [inferred] (mirrors
+    # the copilot-instructions discovery pattern).
+    for base in (ad, root):
+        p = os.path.join(base, ".github", "mcp.json")
+        obj = read_json_obj(p)
+        if obj is not None:
+            tag = "project" if base == ad else "project [inferred: found at git root]"
+            mcp_from_json_block(res, obj.get("mcpServers") or obj.get("servers"),
+                                p, tag,
+                                "[documented] .github/mcp.json = project scope")
+            break
+    else:
+        p = os.path.join(ad, ".github", "mcp.json")
+        if os.path.exists(p):
+            res["warnings"].append("%s exists but is unreadable/not JSON" % p)
+    # Global scope. [documented] locations.
+    cph = os.environ.get("COPILOT_HOME", "")
+    gp = os.path.join(cph, "mcp-config.json") if cph else None
+    if not gp or not os.path.exists(gp):
+        gp = os.path.join(h, ".copilot", "mcp-config.json")
+    obj = read_json_obj(gp)
+    if obj is None:
+        if os.path.exists(gp):
+            res["warnings"].append("%s exists but is unreadable/not JSON" % gp)
+    else:
+        mcp_from_json_block(res, obj.get("mcpServers") or obj.get("servers"),
+                            gp, "global",
+                            "[documented] mcp-config.json = global scope")
+    mcp_collisions(res, "[inferred]")
+    return res
+
+
+def resolve_mcp_gemini(d):
+    res = new_mcp_resolution("gemini")
+    _resolve_mcp_jsonpair(
+        res, d,
+        (os.path.join(".gemini", "settings.json"), "project",
+         "[documented] .gemini/settings.json mcpServers = project scope"),
+        (os.path.join(".gemini", "settings.json"), "user",
+         "[documented] ~/.gemini/settings.json mcpServers = user scope"))
+    return res
+
+
+MCP_RESOLVERS = {"codex": resolve_mcp_codex, "claude": resolve_mcp_claude,
+                 "cursor": resolve_mcp_cursor, "copilot": resolve_mcp_copilot,
+                 "gemini": resolve_mcp_gemini}
+RESOLVERS = {"instructions": INSTR_RESOLVERS, "mcp": MCP_RESOLVERS}
+
+
+def mcp_server_lines(s):
+    lines = ["  - %s  [%s scope, %s]" % (s["name"], s["scope"], s["source"])]
+    if s["transport"] == "http":
+        lines.append("    transport: http (REMOTE — never probed), url: %s" % s["url"])
+    elif s["transport"] == "stdio":
+        cmd = s["command"] + (" " + " ".join(s["args"]) if s["args"] else "")
+        lines.append("    transport: stdio, command: %s" % cmd.strip())
+    else:
+        lines.append("    transport: unknown")
+    if s["env"]:
+        lines.append("    env: %s" % ", ".join(
+            "%s=<set>" % k for k in sorted(s["env"])))
+    if s["headers"]:
+        lines.append("    headers: %s" % ", ".join(
+            "%s=<set>" % k for k in sorted(s["headers"])))
+    lines.append("    via: %s" % s["via"])
+    if s["note"]:
+        lines.append("    note: %s" % s["note"])
+    return lines
+
+
+def render_mcp_text(results, outline=False):
+    lines = [BANNER, "",
+             "SECRET SAFETY: env/header VALUES and URL query strings are never "
+             "printed — only names and masked URLs.", ""]
+    for r in results:
+        lines.append("== %s (MCP servers) ==" % r["harness"])
+        if outline:
+            for s in r["servers"]:
+                lines.append("  %s  [%s]" % (s["name"], s["scope"]))
+        elif not r["servers"]:
+            lines.append("  (no MCP servers resolve for this directory)")
+        else:
+            for s in r["servers"]:
+                lines.extend(mcp_server_lines(s))
+        for w in r["warnings"]:
+            lines.append("  WARNING: %s" % w)
+        for n in r["notes"]:
+            lines.append("  note: %s" % n)
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def render_mcp_json(results, directory):
+    return json.dumps({
+        "tool": "agentscope", "version": VERSION, "mode": "mcp",
+        "rules_verified": RULES_VERIFIED,
+        "directory": os.path.abspath(directory),
+        "disclaimer": "model of documented harness behavior, not runtime "
+                      "truth; secret values never included",
+        "harnesses": [{"harness": r["harness"], "servers": r["servers"],
+                       "warnings": r["warnings"], "notes": r["notes"]}
+                      for r in results],
+    }, indent=2) + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -670,6 +1016,10 @@ def build_parser():
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--diff-harness", nargs=2, metavar=("A", "B"),
                     help="compare the loaded file sets of two harnesses")
+    ap.add_argument("--mcp", action="store_true",
+                    help="resolve the effective MCP server set per harness "
+                         "instead of instruction files (env values and URL "
+                         "query strings are never printed; --full refused)")
     ap.add_argument("--version", action="store_true", help="print version and exit")
     return ap
 
@@ -693,6 +1043,11 @@ def main(argv=None):
     if not os.path.isdir(d):
         print("agentscope: not a directory: %s" % args.directory, file=sys.stderr)
         return 2
+    mode = "mcp" if args.mcp else "instructions"
+    if args.mcp and args.full:
+        print("agentscope: --full is refused in --mcp mode (config files may "
+              "contain secrets)", file=sys.stderr)
+        return 2
     if args.diff_harness:
         names = []
         for n in args.diff_harness:
@@ -701,24 +1056,31 @@ def main(argv=None):
                 print("agentscope: unknown harness: %s" % n, file=sys.stderr)
                 return 2
             names.append(nn)
-        ra = RESOLVERS[names[0]](d)
-        rb = RESOLVERS[names[1]](d)
-        sa = {c["path"] for c in ra["contributors"]}
-        sb = {c["path"] for c in rb["contributors"]}
+        ra = RESOLVERS[mode][names[0]](d)
+        rb = RESOLVERS[mode][names[1]](d)
+        if mode == "mcp":
+            sa = {s["name"] for s in ra["servers"]}
+            sb = {s["name"] for s in rb["servers"]}
+            what = "MCP servers"
+        else:
+            sa = {c["path"] for c in ra["contributors"]}
+            sb = {c["path"] for c in rb["contributors"]}
+            what = "instruction files"
         if args.json:
-            print(json.dumps({"a": names[0], "b": names[1],
+            print(json.dumps({"a": names[0], "b": names[1], "mode": mode,
+                              "what": what,
                               "only_in_a": sorted(sa - sb),
                               "only_in_b": sorted(sb - sa),
                               "in_both": sorted(sa & sb)}, indent=2))
         else:
             print(BANNER + "\n")
-            print("only in %s:" % names[0])
+            print("only in %s (%s):" % (names[0], what))
             for p in sorted(sa - sb):
                 print("  - %s" % p)
-            print("only in %s:" % names[1])
+            print("only in %s (%s):" % (names[1], what))
             for p in sorted(sb - sa):
                 print("  - %s" % p)
-            print("in both:")
+            print("in both (%s):" % what)
             for p in sorted(sa & sb):
                 print("  = %s" % p)
         return 0
@@ -733,11 +1095,17 @@ def main(argv=None):
                 names.append(nn)
     else:
         names = list(HARNESSES)
-    results = [RESOLVERS[n](d) for n in names]
+    results = [RESOLVERS[mode][n](d) for n in names]
     if args.json:
-        sys.stdout.write(render_json(results, d))
+        sys.stdout.write(render_mcp_json(results, d) if mode == "mcp"
+                         else render_json(results, d))
     else:
-        sys.stdout.write(render_text(results, full=args.full, outline=args.outline))
+        sys.stdout.write(render_mcp_text(results, outline=args.outline)
+                         if mode == "mcp"
+                         else render_text(results, full=args.full,
+                                          outline=args.outline))
+    if mode == "mcp":
+        return 0 if any(r["servers"] for r in results) else 1
     return 0 if any(r["contributors"] for r in results) else 1
 
 

@@ -1,6 +1,7 @@
-# agentscope — effective-instruction resolver
+# agentscope — effective-instruction and effective-MCP resolver
 
-"What instructions does harness X actually load for directory Y?"
+"What instructions does harness X actually load for directory Y?" —
+and, since v1.1.0, "which **MCP servers** does it actually load?"
 
 Every coding-agent harness discovers instruction files with different
 semantics. Codex concatenates root-to-cwd with a silent 32 KiB cap. Claude
@@ -22,11 +23,50 @@ agentscope --outline                    # structure only
 agentscope --full                       # also print the merged content
 agentscope --json
 agentscope --diff-harness codex claude apps/web
+agentscope --list-harnesses               # list supported harnesses
+agentscope --version
 ```
 
 Exit codes: **0** = at least one contributing file resolved; **1** = the
 selected harness(es) would load nothing (itself a useful answer);
 **2** = usage error.
+
+## `--mcp`: effective MCP server resolution (v1.1.0)
+
+```bash
+agentscope --mcp                          # all harnesses, current dir
+agentscope --mcp --harness claude .
+agentscope --mcp --json
+agentscope --mcp --outline
+agentscope --mcp --diff-harness claude codex .
+```
+
+Reports the effective MCP server set per harness for the directory —
+name, config scope (project/user/local/global), source file, transport
+(`stdio` with command+args, or `http` for remote servers — listed as
+REMOTE, never probed), and env/header **names** only.
+
+**Secret safety is structural, not documentary:**
+
+- env var and header *values* are never printed — only `NAME=<set>`
+- URL query strings and fragments are stripped (they may carry tokens)
+- `--full` is refused in `--mcp` mode (exit 2)
+- the tool never connects to any server it lists
+
+Per-harness config locations (verified against the Microsoft APM
+per-harness table, 2026-10-22):
+
+| Harness | Project scope | User/global scope |
+|---|---|---|
+| `claude` | `./.mcp.json` (project-scoped servers prompt for interactive approval) | `~/.claude.json` `mcpServers` (user); per-project `projects[]` keys (local) |
+| `codex` | `./.codex/config.toml` (only when `.codex/` exists) | `~/.codex/config.toml`, `[mcp_servers.*]` |
+| `cursor` | `<git-root>/.cursor/mcp.json` | `~/.cursor/mcp.json` |
+| `copilot` | `./.github/mcp.json` (nearest up the tree, inferred) | `$COPILOT_HOME/mcp-config.json` else `~/.copilot/mcp-config.json` |
+| `gemini` | `./.gemini/settings.json` `mcpServers` | `~/.gemini/settings.json` `mcpServers` |
+
+Same-name servers defined in multiple scopes are surfaced as warnings
+(the merge order is not documented per scope); rules are tagged
+`[documented]`/`[inferred]` as in instruction mode.
 
 ## Supported harnesses
 
@@ -68,11 +108,12 @@ session hinges on it, confirm against the harness's own docs.
 ## Testing
 
 ```bash
-python3 -m unittest test_agentscope -v   # 27 tests
+python3 -m unittest test_agentscope -v   # 45 tests
 ```
 
-Stdlib only (Python 3.8+). No dependencies. Strictly read-only — the
-suite asserts the tool never writes to the resolved directory.
+Stdlib only (Python 3.11+, for `tomllib`). No dependencies. Strictly
+read-only — the suite asserts the tool never writes to the resolved
+directory.
 
 ## License
 

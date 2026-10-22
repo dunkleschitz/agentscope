@@ -18,6 +18,8 @@ loaded set per harness for a directory, from the files on disk.
     agentscope --full                  # also print the merged content
     agentscope --json
     agentscope --diff-harness codex claude apps/web
+    agentscope --hooks                          # effective hook sets
+    agentscope --hooks --harness claude .
 
 Exit codes: 0 = at least one contributing file resolved; 1 = no instruction
 files found for the selected harness(es) (the harness would load nothing);
@@ -47,7 +49,7 @@ import os
 import re
 import sys
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 RULES_VERIFIED = "2026-10-22"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -920,6 +922,392 @@ def render_mcp_json(results, directory):
                       for r in results],
     }, indent=2) + "\n"
 
+def hook_lines(hk):
+    line = "  - %s  [matcher %r, %s scope, %s]" % (
+        hk["event"], hk["matcher"], hk["scope"], hk["source"])
+    out = [line, "    command: %s" % hk["command"]]
+    if hk["timeout"] is not None:
+        out.append("    timeout: %s" % hk["timeout"])
+    out.append("    via: %s" % hk["via"])
+    if hk["note"]:
+        out.append("    note: %s" % hk["note"])
+    return out
+
+
+def render_hooks_text(results, outline=False):
+    lines = [BANNER, "",
+             "NEVER EXECUTED: agentscope only parses hook config; it never "
+             "runs hook commands.", ""]
+    for r in results:
+        lines.append("== %s (hooks) ==" % r["harness"])
+        if outline:
+            for hk in r["hooks"]:
+                lines.append("  %s  [%r, %s]" % (
+                    hk["event"], hk["matcher"], hk["scope"]))
+        elif not r["hooks"]:
+            lines.append("  (no hooks resolve for this directory)")
+        else:
+            for hk in r["hooks"]:
+                lines.extend(hook_lines(hk))
+        for w in r["warnings"]:
+            lines.append("  WARNING: %s" % w)
+        for n in r["notes"]:
+            lines.append("  note: %s" % n)
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def render_hooks_json(results, directory):
+    return json.dumps({
+        "tool": "agentscope", "version": VERSION, "mode": "hooks",
+        "rules_verified": RULES_VERIFIED,
+        "directory": os.path.abspath(directory),
+        "disclaimer": "model of documented harness behavior, not runtime "
+                      "truth; hook commands are never executed",
+        "harnesses": [{"harness": r["harness"],
+                       "hooks": [dict(h) for h in r["hooks"]],
+                       "warnings": r["warnings"], "notes": r["notes"]}
+                      for r in results],
+    }, indent=2) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Hook resolution (v1.2.0) — "which hooks does harness X actually fire for
+# directory Y?"
+# --------------------------------------------------------------------------
+# Same honesty model: a model of DOCUMENTED harness behavior, not runtime
+# truth. Hook-config layouts verified via web search (2026-10-22).
+#
+# EXECUTION SAFETY IS STRUCTURAL, not documentary:
+#   - hooks are arbitrary shell commands; agentscope NEVER executes anything.
+#     --hooks mode is pure config parsing. Hook command text is shown verbatim
+#     for the operator to inspect, but it is never passed to a shell, a
+#     subprocess, or any other execution path.
+#   - hook commands may embed credentials (e.g. Authorization headers); the
+#     operator reading this output owns the machine and the config. See
+#     README Limitations.
+# Every harness rule is tagged [documented]/[inferred] with the
+# RULES_VERIFIED date; output is bannered as a model, never runtime truth.
+# Strictly READ-ONLY: never writes, never executes, never touches the network.
+
+CLAUDE_HOOK_EVENTS = (  # [documented] Claude Code event names
+    "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch",
+    "PermissionRequest", "UserPromptSubmit", "UserPromptExpansion",
+    "SessionStart", "SessionEnd", "Stop", "SubagentStop", "ConfigChange",
+    "CwdChanged", "FileChanged", "TaskCreated", "TaskCompleted",
+    "Notification", "PreCompact",
+)
+
+
+def new_hook_resolution(harness):
+    return {"harness": harness, "hooks": [], "warnings": [], "notes": []}
+
+
+def add_hook(res, event, matcher, source, scope, command, via,
+             timeout=None, note=""):
+    hk = {"event": str(event), "matcher": matcher or "",
+          "source": source, "scope": scope,
+          "command": command or "", "timeout": timeout,
+          "via": via, "note": note or ""}
+    res["hooks"].append(hk)
+    return hk
+
+
+def hooks_from_claude_shape(res, obj, source, scope, via):
+    """Parse the Claude-style hooks map:
+
+    {"hooks": {Event: [{"matcher": "...",
+                        "hooks": [{"type": "command", "command": "...",
+                                   "timeout": N}]}]}}
+
+    [documented] shape for claude; [documented] as the shape Codex and
+    Cursor borrow (matcher-name mapping differs per harness, noted by
+    callers). Entries without a command string are surfaced as warnings,
+    not silently dropped.
+    """
+    if obj is None:
+        return
+    if not isinstance(obj, dict):
+        res["warnings"].append(
+            "%s is not a JSON object; skipped" % source)
+        return
+    block = obj.get("hooks")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        res["warnings"].append(
+            "%s 'hooks' is not an object; skipped" % source)
+        return
+    for event, groups in block.items():
+        if not isinstance(groups, list):
+            res["warnings"].append(
+                "%s event %r is not a list; skipped" % (source, event))
+            continue
+        for grp in groups:
+            if not isinstance(grp, dict):
+                res["warnings"].append(
+                    "%s event %r has a non-object matcher group; skipped"
+                    % (source, event))
+                continue
+            matcher = grp.get("matcher", "")
+            entries = grp.get("hooks")
+            if not isinstance(entries, list):
+                res["warnings"].append(
+                    "%s event %r matcher %r has no 'hooks' list; skipped"
+                    % (source, event, matcher))
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    res["warnings"].append(
+                        "%s event %r has a non-object hook entry; skipped"
+                        % (source, event))
+                    continue
+                cmd = entry.get("command")
+                if not cmd:
+                    res["warnings"].append(
+                        "%s event %r matcher %r: hook entry has no "
+                        "'command' (type=%r); skipped" %
+                        (source, event, matcher, entry.get("type")))
+                    continue
+                add_hook(res, event, matcher, source, scope, cmd, via,
+                         timeout=entry.get("timeout"))
+
+
+def hooks_from_copilot_shape(res, obj, source, scope, via):
+    """Parse Copilot hook files: {"version": 1, "hooks": {event: [...]}}.
+    [documented] per awesome-copilot lifecycle-hooks guide. Command key may
+    be "bash" or "command"; timeout key "timeoutSec"."""
+    if obj is None:
+        return
+    if not isinstance(obj, dict):
+        res["warnings"].append("%s is not a JSON object; skipped" % source)
+        return
+    if obj.get("version") != 1:
+        res["warnings"].append(
+            "%s: missing or unexpected 'version' (expected 1); parsed "
+            "anyway" % source)
+    block = obj.get("hooks")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        res["warnings"].append("%s 'hooks' is not an object; skipped" % source)
+        return
+    for event, entries in block.items():
+        if not isinstance(entries, list):
+            res["warnings"].append(
+                "%s event %r is not a list; skipped" % (source, event))
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                res["warnings"].append(
+                    "%s event %r has a non-object hook entry; skipped"
+                    % (source, event))
+                continue
+            cmd = entry.get("bash") or entry.get("command")
+            if not cmd:
+                res["warnings"].append(
+                    "%s event %r: hook entry has neither 'bash' nor "
+                    "'command'; skipped" % (source, event))
+                continue
+            add_hook(res, event, entry.get("matcher", ""), source, scope,
+                     cmd, via, timeout=entry.get("timeoutSec"))
+
+
+def hook_files_from_dir(res, dirpath, scope, via, parser, glob="*.json"):
+    """Read every JSON file in a hooks directory. [inferred] ordering."""
+    if not os.path.isdir(dirpath):
+        return
+    for name in sorted(os.listdir(dirpath)):
+        if not name.endswith(".json"):
+            continue
+        p = os.path.join(dirpath, name)
+        obj = read_json_obj(p)
+        if obj is None:
+            res["warnings"].append("%s exists but is unreadable/not JSON" % p)
+            continue
+        parser(res, obj, p, scope, via)
+
+
+def resolve_hooks_claude(d):
+    res = new_hook_resolution("claude")
+    h = home()
+    ad = os.path.abspath(d)
+    files = [
+        (os.path.join(h, ".claude", "settings.json"), "user",
+         "[documented] ~/.claude/settings.json = user scope"),
+        (os.path.join(ad, ".claude", "settings.json"), "project",
+         "[documented] .claude/settings.json = project scope"),
+        (os.path.join(ad, ".claude", "settings.local.json"), "local",
+         "[documented] .claude/settings.local.json = personal (gitignored) "
+         "scope"),
+    ]
+    for path, scope, via in files:
+        obj = read_json_obj(path)
+        if obj is None:
+            if os.path.exists(path):
+                res["warnings"].append(
+                    "%s exists but is unreadable/not JSON" % path)
+            continue
+        hooks_from_claude_shape(res, obj, path, scope, via)
+    for hk in res["hooks"]:
+        if hk["event"] not in CLAUDE_HOOK_EVENTS:
+            res["warnings"].append(
+                "[inferred] event %r in %s is not a documented Claude Code "
+                "event; the harness may ignore it" % (hk["event"],
+                                                      hk["source"]))
+    res["notes"].append(
+        "[documented] hooks from all scopes fire; hooks load at session "
+        "start (config changes need a restart); matchers are regexes "
+        "matched against the tool name")
+    res["notes"].append(
+        "[inferred] plugin-managed hooks (.claude/plugins/) are not "
+        "enumerated here")
+    return res
+
+
+def resolve_hooks_codex(d):
+    res = new_hook_resolution("codex")
+    h = home()
+    ad = os.path.abspath(d)
+    files = [
+        (os.path.join(h, ".codex", "hooks.json"), "global",
+         "[documented] ~/.codex/hooks.json = global scope"),
+    ]
+    proj_dir = os.path.join(ad, ".codex")
+    if os.path.isdir(proj_dir):
+        files.append((os.path.join(proj_dir, "hooks.json"), "project",
+                      "[documented] .codex/hooks.json = project scope"))
+        files.append((os.path.join(proj_dir, "config.toml"), "project",
+                      "[documented] [hooks] in .codex/config.toml = project "
+                      "scope"))
+    else:
+        res["notes"].append(
+            "[documented] no .codex/ dir here, so no project-scope hooks")
+    for path, scope, via in files:
+        if path.endswith(".toml"):
+            obj = read_toml_obj(path)
+            if obj is not None:
+                obj = {"hooks": obj.get("hooks")}
+            hook_via = via
+        else:
+            obj = read_json_obj(path)
+            hook_via = via
+        if obj is None:
+            if os.path.exists(path):
+                res["warnings"].append(
+                    "%s exists but is unreadable" % path)
+            continue
+        hooks_from_claude_shape(res, obj, path, scope,
+                                hook_via + "; [inferred] Codex borrows the "
+                                "Claude hook shape")
+    if any(hk["scope"] == "project" for hk in res["hooks"]):
+        res["notes"].append(
+            "[documented] Codex loads project hooks only in trusted "
+            "projects; a changed hook is skipped until re-trusted")
+    res["notes"].append(
+        "[inferred] blocking = exit 2 or permissionDecision deny; matching "
+        "hooks start at once, so one cannot stop another; tool-name mapping "
+        "differs from Claude (e.g. Edit|Write matchers may need "
+        "apply_patch)")
+    return res
+
+
+CURSOR_HOOK_NAME_MAP = {  # [documented] Cursor's tool-name mapping
+    "Bash": "Shell", "Edit": "Write", "UserPromptSubmit": "beforeSubmitPrompt",
+}
+
+
+def resolve_hooks_cursor(d):
+    res = new_hook_resolution("cursor")
+    h = home()
+    ad = os.path.abspath(d)
+    files = [
+        (os.path.join(h, ".cursor", "hooks.json"), "global",
+         "[documented] ~/.cursor/hooks.json = global scope"),
+        (os.path.join(ad, ".cursor", "hooks.json"), "project",
+         "[documented] .cursor/hooks.json = project scope"),
+    ]
+    for path, scope, via in files:
+        obj = read_json_obj(path)
+        if obj is None:
+            if os.path.exists(path):
+                res["warnings"].append(
+                    "%s exists but is unreadable/not JSON" % path)
+            continue
+        hooks_from_claude_shape(res, obj, path, scope, via)
+    # Cursor also reads Claude's hook configs by default. [documented]
+    claude_files = [
+        (os.path.join(h, ".claude", "settings.json"), "user (via claude)",
+         "[documented] Cursor reads Claude's settings by default"),
+        (os.path.join(ad, ".claude", "settings.json"), "project (via claude)",
+         "[documented] Cursor reads Claude's settings by default"),
+        (os.path.join(ad, ".claude", "settings.local.json"),
+         "local (via claude)",
+         "[documented] Cursor reads Claude's settings by default"),
+    ]
+    for path, scope, via in claude_files:
+        obj = read_json_obj(path)
+        if obj is None:
+            continue
+        before = len(res["hooks"])
+        hooks_from_claude_shape(res, obj, path, scope, via)
+        for hk in res["hooks"][before:]:
+            hk["note"] = ("[documented] Cursor maps Claude tool names: "
+                          + ", ".join("%s->%s" % kv
+                                      for kv in sorted(
+                                          CURSOR_HOOK_NAME_MAP.items())))
+    if res["hooks"]:
+        res["notes"].append(
+            "[documented] Cursor does NOT map Notification or "
+            "PermissionRequest events; it fails open when a hook crashes, "
+            "so guard scripts should exit 2 on unparseable input")
+    return res
+
+
+def resolve_hooks_copilot(d):
+    res = new_hook_resolution("copilot")
+    h = home()
+    ad = os.path.abspath(d)
+    root = git_root(ad) or ad
+    via_repo = ("[documented] .github/hooks/*.json = repo scope; [inferred] "
+                "nearest-up-the-tree discovery mirrors the copilot-"
+                "instructions pattern")
+    found = False
+    for base in (ad, root):
+        dirpath = os.path.join(base, ".github", "hooks")
+        if os.path.isdir(dirpath):
+            hook_files_from_dir(res, dirpath, "repo", via_repo,
+                                hooks_from_copilot_shape)
+            found = True
+            break
+    if not found:
+        res["notes"].append(
+            "[documented] no .github/hooks/ dir here, so no repo-scope hooks")
+    hook_files_from_dir(
+        res, os.path.join(h, ".copilot", "hooks"), "user",
+        "[documented] ~/.copilot/hooks/*.json = user scope",
+        hooks_from_copilot_shape)
+    res["notes"].append(
+        "[documented] hook sources are merged (policy > user > repo > "
+        "plugin); policy hooks are machine-wide and not enumerable from "
+        "here; plugin-declared hooks are not enumerated here; "
+        "end users cannot disable policy hooks")
+    return res
+
+
+def resolve_hooks_gemini(d):
+    res = new_hook_resolution("gemini")
+    res["notes"].append(
+        "[inferred] no documented hook/lifecycle-event mechanism found for "
+        "the Gemini CLI (verified 2026-10-22); nothing to resolve")
+    return res
+
+
+HOOK_RESOLVERS = {"codex": resolve_hooks_codex, "claude": resolve_hooks_claude,
+                  "cursor": resolve_hooks_cursor,
+                  "copilot": resolve_hooks_copilot,
+                  "gemini": resolve_hooks_gemini}
+RESOLVERS["hooks"] = HOOK_RESOLVERS
 
 # --------------------------------------------------------------------------
 # output
@@ -1020,6 +1408,10 @@ def build_parser():
                     help="resolve the effective MCP server set per harness "
                          "instead of instruction files (env values and URL "
                          "query strings are never printed; --full refused)")
+    ap.add_argument("--hooks", action="store_true",
+                    help="resolve the effective hook set per harness "
+                         "instead of instruction files (pure config parsing; "
+                         "hook commands are never executed; --full ignored)")
     ap.add_argument("--version", action="store_true", help="print version and exit")
     return ap
 
@@ -1043,7 +1435,12 @@ def main(argv=None):
     if not os.path.isdir(d):
         print("agentscope: not a directory: %s" % args.directory, file=sys.stderr)
         return 2
-    mode = "mcp" if args.mcp else "instructions"
+    modes = [m for m, on in (("mcp", args.mcp), ("hooks", args.hooks)) if on]
+    if len(modes) > 1:
+        print("agentscope: --mcp and --hooks are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    mode = modes[0] if modes else "instructions"
     if args.mcp and args.full:
         print("agentscope: --full is refused in --mcp mode (config files may "
               "contain secrets)", file=sys.stderr)
@@ -1062,6 +1459,13 @@ def main(argv=None):
             sa = {s["name"] for s in ra["servers"]}
             sb = {s["name"] for s in rb["servers"]}
             what = "MCP servers"
+        elif mode == "hooks":
+            def _hk(h):
+                return "%s [matcher %r]: %s" % (h["event"], h["matcher"],
+                                                h["command"])
+            sa = {_hk(h) for h in ra["hooks"]}
+            sb = {_hk(h) for h in rb["hooks"]}
+            what = "hooks"
         else:
             sa = {c["path"] for c in ra["contributors"]}
             sb = {c["path"] for c in rb["contributors"]}
@@ -1097,15 +1501,24 @@ def main(argv=None):
         names = list(HARNESSES)
     results = [RESOLVERS[mode][n](d) for n in names]
     if args.json:
-        sys.stdout.write(render_mcp_json(results, d) if mode == "mcp"
-                         else render_json(results, d))
+        if mode == "mcp":
+            sys.stdout.write(render_mcp_json(results, d))
+        elif mode == "hooks":
+            sys.stdout.write(render_hooks_json(results, d))
+        else:
+            sys.stdout.write(render_json(results, d))
     else:
-        sys.stdout.write(render_mcp_text(results, outline=args.outline)
-                         if mode == "mcp"
-                         else render_text(results, full=args.full,
-                                          outline=args.outline))
+        if mode == "mcp":
+            sys.stdout.write(render_mcp_text(results, outline=args.outline))
+        elif mode == "hooks":
+            sys.stdout.write(render_hooks_text(results, outline=args.outline))
+        else:
+            sys.stdout.write(render_text(results, full=args.full,
+                                         outline=args.outline))
     if mode == "mcp":
         return 0 if any(r["servers"] for r in results) else 1
+    if mode == "hooks":
+        return 0 if any(r["hooks"] for r in results) else 1
     return 0 if any(r["contributors"] for r in results) else 1
 
 

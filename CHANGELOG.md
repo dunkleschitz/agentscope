@@ -1,5 +1,23 @@
 # CHANGELOG — agentscope
 
+## 1.2.0 (2026-10-22)
+
+`--hooks` mode: effective hook resolution per harness for a directory —
+event, matcher, config scope, source file, hook command, timeout.
+Hook-config layouts verified via web search 2026-10-22 (Claude's three
+settings files; Codex `hooks.json`/`[hooks]` with trusted-project gate;
+Cursor's own files plus Claude's settings with tool-name mapping;
+Copilot's `.github/hooks/*.json` + `~/.copilot/hooks/*.json`; Gemini has
+no documented hook mechanism). The execution hazard is structural:
+`--hooks` is pure config parsing — hook commands are shown verbatim but
+never executed (covered by a dedicated test asserting a planted
+`touch`-marker command never runs); commands may embed credentials, so
+the output is treated like the config file itself (README Limitations).
+`--diff-harness` works in `--hooks` mode (caught and fixed a real tuple-
+formatting bug in the diff path during the build). 60 tests (15 new),
+all green. Dogfooded with doccover (flagged the missing README docs,
+now fixed) and clicheck (15/15 with correct option placement).
+
 ## 1.1.0 (2026-10-22)
 
 `--mcp` mode: effective MCP server resolution per harness for a

@@ -293,7 +293,7 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.1.0", r.stdout)
+        self.assertIn("1.2.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini"):
             self.assertIn(h, r.stdout)
@@ -520,3 +520,228 @@ class McpTests(Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class HooksTests(Base):
+    CLAUDE_SETTINGS = json.dumps({
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash",
+                 "hooks": [{"type": "command",
+                            "command": "/hooks/guard.sh",
+                            "timeout": 30}]},
+                {"matcher": "Edit|Write",
+                 "hooks": [{"type": "command",
+                            "command": "/hooks/fmt.sh"}]},
+            ],
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": "/hooks/ctx.sh"}]}
+            ],
+        }
+    })
+
+    def claude_struct(self, extra=None):
+        s = {
+            ".claude/settings.json": self.CLAUDE_SETTINGS,
+        }
+        if extra:
+            s.update(extra)
+        return s
+
+    def hooks_json(self, root, home, *args):
+        r = self.tool(home, "--hooks", "--json", *args, root)
+        self.assertEqual(r.returncode, 0)
+        hks = {}
+        for h in json.loads(r.stdout)["harnesses"]:
+            hks[h["harness"]] = h["hooks"]
+        return hks, json.loads(r.stdout)
+
+    def test_claude_three_scopes(self):
+        root, home = self.tree(self.claude_struct({
+            os.path.join(".claude", "settings.local.json"): json.dumps({
+                "hooks": {"Stop": [{"hooks": [{"type": "command",
+                                               "command": "/hooks/stop.sh"}]}]}}),
+        }))
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        with open(os.path.join(home, ".claude", "settings.json"), "w") as f:
+            f.write(json.dumps({
+                "hooks": {"UserPromptSubmit": [
+                    {"hooks": [{"type": "command",
+                                "command": "/hooks/prompt.sh"}]}]}}))
+        hks, _ = self.hooks_json(root, home, "--harness", "claude")
+        cl = hks["claude"]
+        self.assertEqual(len(cl), 5)
+        scopes = {(h["event"], h["matcher"], h["scope"]) for h in cl}
+        self.assertIn(("PreToolUse", "Bash", "project"), scopes)
+        self.assertIn(("UserPromptSubmit", "", "user"), scopes)
+        self.assertIn(("Stop", "", "local"), scopes)
+        by_evt = {(h["event"], h["matcher"]): h for h in cl}
+        self.assertEqual(by_evt[("PreToolUse", "Bash")]["command"], "/hooks/guard.sh")
+        self.assertEqual(by_evt[("PreToolUse", "Bash")]["timeout"], 30)
+        self.assertIsNone(by_evt[("PreToolUse", "Edit|Write")]["timeout"])
+        for h in cl:
+            self.assertIn("[documented]", h["via"])
+
+    def test_claude_unknown_event_warned(self):
+        root, home = self.tree({
+            ".claude/settings.json": json.dumps({
+                "hooks": {"MadeUpEvent": [
+                    {"hooks": [{"type": "command", "command": "x"}]}]}}),
+        })
+        r = self.tool(home, "--hooks", "--harness", "claude", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("not a documented Claude Code event", r.stdout)
+
+    def test_claude_entry_without_command_skipped(self):
+        root, home = self.tree({
+            ".claude/settings.json": json.dumps({
+                "hooks": {"Stop": [{"hooks": [{"type": "prompt",
+                                              "prompt": "check"}]}]}}),
+        })
+        r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
+        self.assertEqual(r.returncode, 1)  # nothing resolvable
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["hooks"], [])
+        self.assertTrue(any("no 'command'" in w for w in h["warnings"]))
+
+    def test_claude_malformed_json_warned(self):
+        root, home = self.tree({".claude/settings.json": "{not json"})
+        r = self.tool(home, "--hooks", "--harness", "claude", root)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("unreadable/not JSON", r.stdout)
+
+    def test_codex_json_and_toml(self):
+        root, home = self.tree({
+            ".codex/hooks.json": json.dumps({
+                "hooks": {"PreToolUse": [
+                    {"matcher": "Bash",
+                     "hooks": [{"type": "command", "command": "c.sh"}]}]}}),
+            ".codex/config.toml": '[hooks]\nPostToolUse = [{matcher = "*", hooks = [{type = "command", command = "t.sh"}]}]\n',
+        })
+        r = self.tool(home, "--hooks", "--harness", "codex", "--json", root)
+        self.assertEqual(r.returncode, 0)
+        cx = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(len(cx["hooks"]), 2)
+        self.assertTrue(all(h["scope"] == "project" for h in cx["hooks"]))
+        self.assertTrue(any("trusted projects" in n for n in cx["notes"]))
+        self.assertTrue(any("borrows the Claude hook shape" in h["via"]
+                            for h in cx["hooks"]))
+
+    def test_codex_no_proj_dir_note(self):
+        root, home = self.tree({})
+        r = self.tool(home, "--hooks", "--harness", "codex", root)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no .codex/ dir", r.stdout)
+
+    def test_cursor_reads_own_and_claude_hooks(self):
+        root, home = self.tree({
+            ".cursor/hooks.json": json.dumps({
+                "hooks": {"PreToolUse": [
+                    {"matcher": "Shell",
+                     "hooks": [{"type": "command", "command": "cur.sh"}]}]}}),
+            ".claude/settings.json": self.CLAUDE_SETTINGS,
+        })
+        hks, _ = self.hooks_json(root, home, "--harness", "cursor")
+        cur = hks["cursor"]
+        self.assertEqual(len(cur), 3 + 1)  # 1 own + 3 via claude
+        via_claude = [h for h in cur if "via claude" in h["scope"]]
+        self.assertEqual(len(via_claude), 3)
+        self.assertTrue(all("Bash->Shell" in h["note"] for h in via_claude))
+        own = [h for h in cur if h["scope"] == "project"]
+        self.assertEqual(own[0]["command"], "cur.sh")
+
+    def test_copilot_repo_and_user_hooks(self):
+        root, home = self.tree({
+            ".git": None,
+            ".github/hooks/router.json": json.dumps({
+                "version": 1,
+                "hooks": {"postToolUse": [
+                    {"matcher": "edit|create",
+                     "bash": ".github/hooks/scripts/test-router.sh",
+                     "timeoutSec": 60}]}}),
+        })
+        os.makedirs(os.path.join(home, ".copilot", "hooks"), exist_ok=True)
+        with open(os.path.join(home, ".copilot", "hooks", "u.json"), "w") as f:
+            f.write(json.dumps({
+                "hooks": {"agentStop": [
+                    {"command": "notify.sh"}]}}))  # no version -> warning
+        hks, full = self.hooks_json(root, home, "--harness", "copilot")
+        cp = hks["copilot"]
+        self.assertEqual(len(cp), 2)
+        scopes = {h["scope"] for h in cp}
+        self.assertEqual(scopes, {"repo", "user"})
+        repo = [h for h in cp if h["scope"] == "repo"][0]
+        self.assertEqual(repo["event"], "postToolUse")
+        self.assertEqual(repo["matcher"], "edit|create")
+        self.assertEqual(repo["timeout"], 60)
+        self.assertTrue(any("version" in w for w in
+                            full["harnesses"][0]["warnings"]))
+        self.assertTrue(any("merged" in n for n in
+                            full["harnesses"][0]["notes"]))
+
+    def test_gemini_empty_with_note(self):
+        root, home = self.tree({})
+        r = self.tool(home, "--hooks", "--harness", "gemini", "--json", root)
+        self.assertEqual(r.returncode, 1)
+        g = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(g["hooks"], [])
+        self.assertTrue(any("no documented hook" in n for n in g["notes"]))
+
+    def test_exit_codes_and_text(self):
+        root, home = self.tree(self.claude_struct())
+        r = self.tool(home, "--hooks", "--harness", "claude", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("NEVER EXECUTED", r.stdout)
+        self.assertIn("== claude (hooks) ==", r.stdout)
+        self.assertIn("command: /hooks/guard.sh", r.stdout)
+        r2 = self.tool(home, "--hooks", "--harness", "gemini", root)
+        self.assertEqual(r2.returncode, 1)
+        self.assertIn("(no hooks resolve for this directory)", r2.stdout)
+
+    def test_mcp_and_hooks_exclusive(self):
+        root, home = self.tree({})
+        r = self.tool(home, "--mcp", "--hooks", root)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("mutually exclusive", r.stderr)
+
+    def test_diff_harness_hooks(self):
+        root, home = self.tree(self.claude_struct())
+        r = self.tool(home, "--hooks", "--diff-harness", "claude", "cursor",
+                      root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("only in claude (hooks):", r.stdout)
+        self.assertIn("only in cursor (hooks):", r.stdout)
+
+    def test_outline_mode(self):
+        root, home = self.tree(self.claude_struct())
+        r = self.tool(home, "--hooks", "--harness", "claude", "--outline", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("PreToolUse  ['Bash', project]", r.stdout)
+        self.assertNotIn("command: /hooks/guard.sh", r.stdout)
+
+    def test_json_shape(self):
+        root, home = self.tree(self.claude_struct())
+        r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
+        body = json.loads(r.stdout)
+        self.assertEqual(body["mode"], "hooks")
+        self.assertEqual(body["version"], "1.2.0")
+        self.assertIn("never executed", body["disclaimer"])
+        hk = body["harnesses"][0]["hooks"][0]
+        for k in ("event", "matcher", "source", "scope", "command",
+                  "timeout", "via", "note"):
+            self.assertIn(k, hk)
+
+    def test_never_executes_hooks(self):
+        # A hook command that would create a file if executed must not run.
+        tmpdir = tempfile.mkdtemp()
+        self._tmp.append(tmpdir)
+        marker = os.path.join(tmpdir, "pwned")
+        root, home = self.tree({
+            ".claude/settings.json": json.dumps({
+                "hooks": {"SessionStart": [
+                    {"hooks": [{"type": "command",
+                                "command": "touch %s" % marker}]}]}}),
+        })
+        r = self.tool(home, "--hooks", "--harness", "claude", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(marker))

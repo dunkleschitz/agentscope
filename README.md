@@ -1,7 +1,8 @@
-# agentscope — effective-instruction and effective-MCP resolver
+# agentscope — effective-instruction, effective-MCP, and effective-hook resolver
 
 "What instructions does harness X actually load for directory Y?" —
-and, since v1.1.0, "which **MCP servers** does it actually load?"
+and, since v1.1.0, "which **MCP servers** does it actually load?" —
+and, since v1.2.0, "which **hooks** does it actually fire?"
 
 Every coding-agent harness discovers instruction files with different
 semantics. Codex concatenates root-to-cwd with a silent 32 KiB cap. Claude
@@ -39,6 +40,9 @@ agentscope --mcp --harness claude .
 agentscope --mcp --json
 agentscope --mcp --outline
 agentscope --mcp --diff-harness claude codex .
+agentscope --hooks                          # effective hook sets
+agentscope --hooks --harness claude .
+agentscope --hooks --diff-harness claude cursor .
 ```
 
 Reports the effective MCP server set per harness for the directory —
@@ -67,6 +71,49 @@ per-harness table, 2026-10-22):
 Same-name servers defined in multiple scopes are surfaced as warnings
 (the merge order is not documented per scope); rules are tagged
 `[documented]`/`[inferred]` as in instruction mode.
+
+## `--hooks`: effective hook resolution (v1.2.0)
+
+"Which hooks does harness X actually fire for directory Y?" — the same
+effective-resolution question, for the lifecycle hooks that silently
+shape agent behavior (guards, formatters, context injectors, audit
+loggers). Today it is answered only by running the harness (`/hooks`,
+`claude --debug`) or reading prose guides.
+
+```bash
+agentscope --hooks                          # all harnesses, current dir
+agentscope --hooks --harness claude .
+agentscope --hooks --outline                # events + matchers only
+agentscope --hooks --json
+agentscope --hooks --diff-harness claude cursor .
+```
+
+Reports, per harness: event, matcher, config scope (user/project/local/
+global/repo), source file, the hook command, and timeout where set.
+`--mcp` and `--hooks` are mutually exclusive; `--full` is accepted but
+has no additional effect in `--hooks` mode (the text output already
+shows complete hook definitions).
+
+**The execution hazard is handled structurally, not documentarily:**
+hooks are arbitrary shell commands, so `agentscope` **never executes
+anything** in `--hooks` mode — it only parses config files. Hook
+command text is shown verbatim for the operator to inspect; it is never
+passed to a shell, a subprocess, or any other execution path. (There is
+a test that plants a `touch`-the-marker hook command and asserts the
+marker is never created.)
+
+Per-harness hook sources (verified via web search, 2026-10-22):
+
+| Harness | Sources |
+|---|---|
+| `claude` | `~/.claude/settings.json` (user), `./.claude/settings.json` (project), `./.claude/settings.local.json` (personal); matchers are regexes on tool names; all scopes fire; hooks load at session start |
+| `codex` | `~/.codex/hooks.json` (global), `./.codex/hooks.json` or `[hooks]` in `./.codex/config.toml` (project, trusted projects only); borrows Claude's config shape; blocking = exit 2 or `permissionDecision` deny |
+| `cursor` | `~/.cursor/hooks.json` (global), `./.cursor/hooks.json` (project); also reads Claude's settings by default, with tool-name mapping (`Bash`→`Shell`, `Edit`→`Write`, `UserPromptSubmit`→`beforeSubmitPrompt`; `Notification`/`PermissionRequest` not mapped) |
+| `copilot` | `./.github/hooks/*.json` (repo), `~/.copilot/hooks/*.json` (user); sources merged; policy (machine-wide) and plugin-declared hooks are not enumerable from here |
+| `gemini` | no documented hook mechanism — always empty, with a note |
+
+Exit codes in `--hooks` mode: **0** = at least one hook resolves;
+**1** = none resolve; **2** = usage error.
 
 ## Supported harnesses
 
@@ -104,6 +151,13 @@ session hinges on it, confirm against the harness's own docs.
 - Symlink loops in the directory walk are not followed (`os.walk`
   default); unreadable files are skipped silently per contributor,
   warned per import.
+- `--hooks` prints hook commands verbatim; a hook command may embed
+  credentials (e.g. an `Authorization` header) — treat the output as
+  you would the config file itself.
+- `--hooks` does not enumerate plugin-managed hooks (Claude),
+  policy hooks or plugin-declared hooks (Copilot); hook merge order
+  across scopes is undocumented and reported as `[inferred]` where
+  assumed.
 
 ## Testing
 

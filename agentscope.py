@@ -46,12 +46,13 @@ values and URL query strings are NEVER printed, and --full is refused in
 """
 import argparse
 import fnmatch
+import glob
 import json
 import os
 import re
 import sys
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 RULES_VERIFIED = "2026-10-22"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -67,7 +68,7 @@ MAX_IMPORT_DEPTH = 5          # [inferred] default recursion cap for @-imports
 CODEX_CAP_DEFAULT = 32 * 1024  # [documented] project_doc_max_bytes default
 CLAUDE_IMPORT_HOPS = 4        # [documented] per Claude Code memory docs (via guides)
 
-HARNESSES = ("codex", "claude", "cursor", "copilot", "gemini")
+HARNESSES = ("codex", "claude", "cursor", "copilot", "gemini", "opencode")
 ALIASES = {"claude-code": "claude"}
 
 
@@ -580,9 +581,143 @@ def resolve_gemini(d):
     return res
 
 
+def resolve_opencode(d):
+    """OpenCode instruction resolution.
+
+    Rules verified 2026-10-22 against the vendor docs
+    (opencode.ai/docs/rules/, page itself updated ~1 day before the check).
+    Semantics differ genuinely from the other five harnesses:
+      - FIRST-MATCH-WINS per directory (AGENTS.md shadows CLAUDE.md), not
+        the concatenation every other harness does [documented];
+      - global ~/.config/opencode/AGENTS.md, then a Claude Code compat
+        fallback (~/.claude/CLAUDE.md) gated by OPENCODE_DISABLE_CLAUDE_CODE*
+        env vars [documented];
+      - opencode.json `instructions` array (paths, globs, remote URLs) whose
+        entries are combined with the AGENTS.md files [documented];
+      - opencode does NOT parse @file references in AGENTS.md (no import
+        expansion) [documented];
+      - the harness can attach a nearer instruction file as a system
+        reminder when its read tool opens a file — dynamic per-read
+        behavior, not statically capturable [documented, noted only].
+    The order matches are combined in is [inferred]: docs give the lookup
+    order (local, then global, then Claude-compat), not the merge order.
+    Strictly read-only.
+    """
+    res = new_resolution("opencode")
+    h = home()
+    res["notes"].append(
+        "[documented] precedence: (1) local files traversing up from the cwd "
+        "(first match wins per directory: AGENTS.md over CLAUDE.md), "
+        "(2) ~/.config/opencode/AGENTS.md, (3) ~/.claude/CLAUDE.md compat "
+        "fallback unless disabled by OPENCODE_DISABLE_CLAUDE_CODE or "
+        "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT")
+    # 1. local traversal, cwd -> up; first filename family with a match wins
+    # per directory [documented]. Empty files do not count (same non_empty
+    # convention as the other resolvers) [inferred].
+    for level in upward(d):
+        agents_p = os.path.join(level, "AGENTS.md")
+        claude_p = os.path.join(level, "CLAUDE.md")
+        if non_empty(agents_p):
+            via = ("[documented] first match wins at this level"
+                   if not non_empty(claude_p) else
+                   "[documented] AGENTS.md shadows CLAUDE.md here "
+                   "(first matching file wins)")
+            add_file(res, agents_p, "project", via)
+        elif non_empty(claude_p):
+            add_file(res, claude_p, "project",
+                     "[documented] CLAUDE.md used (no AGENTS.md at this "
+                     "level)")
+    # 2. global file, then Claude compat fallback
+    gp = os.path.join(h, ".config", "opencode", "AGENTS.md")
+    claude_global = os.path.join(h, ".claude", "CLAUDE.md")
+    if non_empty(gp):
+        add_file(res, gp, "global",
+                 "[documented] ~/.config/opencode/AGENTS.md")
+        if non_empty(claude_global):
+            res["notes"].append(
+                "[documented] ~/.claude/CLAUDE.md present but unused: "
+                "global AGENTS.md takes precedence")
+    else:
+        disabled = (os.environ.get("OPENCODE_DISABLE_CLAUDE_CODE") == "1" or
+                    os.environ.get("OPENCODE_DISABLE_CLAUDE_CODE_PROMPT")
+                    == "1")
+        if non_empty(claude_global):
+            if disabled:
+                res["notes"].append(
+                    "[documented] ~/.claude/CLAUDE.md present but the compat "
+                    "fallback is disabled via env (OPENCODE_DISABLE_"
+                    "CLAUDE_CODE*)")
+            else:
+                add_file(res, claude_global, "global",
+                         "[documented] Claude Code compat fallback (no "
+                         "~/.config/opencode/AGENTS.md)")
+        elif not disabled:
+            res["notes"].append(
+                "[inferred] Claude compat fallback checked "
+                "(~/.claude/CLAUDE.md absent)")
+    # 3. opencode.json `instructions` — project config, then global config
+    # [documented]. Entries are paths, globs, or remote URLs. The project
+    # config is found by searching upward (the harness loads it from the
+    # project directory; the search-upward is [inferred]).
+    cfgs = []
+    proj_cfg = None
+    for level in upward(d):
+        cand = os.path.join(level, "opencode.json")
+        if os.path.isfile(cand):
+            proj_cfg = cand
+            break
+    for cfg_path in ([proj_cfg] if proj_cfg else []) + [
+            os.path.join(h, ".config", "opencode", "opencode.json")]:
+        cfg = read_json_obj(cfg_path)
+        if not cfg:
+            continue
+        cfgs.append(cfg_path)
+        cfg_dir = os.path.dirname(cfg_path)
+        entries = cfg.get("instructions") or []
+        if not isinstance(entries, list):
+            res["warnings"].append(
+                "opencode.json `instructions` is not a list: %s" % cfg_path)
+            continue
+        for e in entries:
+            if not isinstance(e, str) or not e:
+                continue
+            if re.match(r"^https?://", e):
+                res["warnings"].append(
+                    "[documented] remote `instructions` entry NOT fetched "
+                    "(read-only; the harness fetches remotes with a 5s "
+                    "timeout): %s" % e)
+                continue
+            pat = e if os.path.isabs(e) else os.path.join(cfg_dir, e)
+            hits = sorted(x for x in glob.glob(pat, recursive=True)
+                          if os.path.isfile(x))
+            if not hits:
+                res["warnings"].append(
+                    "opencode.json `instructions` entry matched nothing: "
+                    "%r (from %s)" % (e, cfg_path))
+                continue
+            for hit in hits:
+                add_file(res, hit, "instructions",
+                         "[documented] opencode.json `instructions` entry "
+                         "%r (%s)" % (e, cfg_path))
+    if cfgs:
+        res["notes"].append(
+            "[documented] `instructions` read from: %s" % ", ".join(cfgs))
+    else:
+        res["notes"].append(
+            "[inferred] no opencode.json found at project or global level")
+    res["notes"].append(
+        "[documented] opencode does NOT parse @file references in AGENTS.md "
+        "(no import expansion — use `instructions` instead)")
+    res["notes"].append(
+        "[documented] the harness can attach a nearer instruction file as a "
+        "system reminder when its read tool opens a file — dynamic per-read "
+        "behavior, not captured by a static resolution")
+    return res
+
+
 INSTR_RESOLVERS = {"codex": resolve_codex, "claude": resolve_claude,
                    "cursor": resolve_cursor, "copilot": resolve_copilot,
-                   "gemini": resolve_gemini}
+                   "gemini": resolve_gemini, "opencode": resolve_opencode}
 
 
 # --------------------------------------------------------------------------
@@ -863,9 +998,18 @@ def resolve_mcp_gemini(d):
     return res
 
 
+def resolve_mcp_opencode(d):
+    res = new_mcp_resolution("opencode")
+    res["notes"].append(
+        "[inferred] OpenCode MCP config lives in opencode.json (`mcp`); the "
+        "layout was not verified against vendor docs on 2026-10-22, so it is "
+        "not modeled — inspect opencode.json directly")
+    return res
+
+
 MCP_RESOLVERS = {"codex": resolve_mcp_codex, "claude": resolve_mcp_claude,
                  "cursor": resolve_mcp_cursor, "copilot": resolve_mcp_copilot,
-                 "gemini": resolve_mcp_gemini}
+                 "gemini": resolve_mcp_gemini, "opencode": resolve_mcp_opencode}
 RESOLVERS = {"instructions": INSTR_RESOLVERS, "mcp": MCP_RESOLVERS}
 
 
@@ -1297,18 +1441,29 @@ def resolve_hooks_copilot(d):
     return res
 
 
+def resolve_hooks_opencode(d):
+    res = new_hook_resolution("opencode")
+    res["notes"].append(
+        "[inferred] OpenCode hooks are not modeled in this version; "
+        "instructions resolution only")
+    return res
+
+
 def resolve_hooks_gemini(d):
     res = new_hook_resolution("gemini")
     res["notes"].append(
-        "[inferred] no documented hook/lifecycle-event mechanism found for "
-        "the Gemini CLI (verified 2026-10-22); nothing to resolve")
+        "[documented] the Gemini CLI HAS a documented hook mechanism (11 "
+        "events; geminicli.com/docs/hooks/, verified 2026-10-22), but "
+        "agentscope --hooks does not model it yet — see hooktest "
+        "--harness gemini for a synthetic-payload tester instead")
     return res
 
 
 HOOK_RESOLVERS = {"codex": resolve_hooks_codex, "claude": resolve_hooks_claude,
                   "cursor": resolve_hooks_cursor,
                   "copilot": resolve_hooks_copilot,
-                  "gemini": resolve_hooks_gemini}
+                  "gemini": resolve_hooks_gemini,
+                  "opencode": resolve_hooks_opencode}
 RESOLVERS["hooks"] = HOOK_RESOLVERS
 
 # --------------------------------------------------------------------------
@@ -1495,11 +1650,21 @@ def resolve_permissions_copilot(d):
     return res
 
 
+def resolve_permissions_opencode(d):
+    res = new_perm_resolution("opencode")
+    res["notes"].append(
+        "[documented] OpenCode has a permission system (glob -> allow/ask/"
+        "deny, last-match-wins per community guides), but it is not modeled "
+        "in this version; instructions resolution only")
+    return res
+
+
 PERM_RESOLVERS = {"codex": resolve_permissions_codex,
                   "claude": resolve_permissions_claude,
                   "cursor": resolve_permissions_cursor,
                   "copilot": resolve_permissions_copilot,
-                  "gemini": resolve_permissions_gemini}
+                  "gemini": resolve_permissions_gemini,
+                  "opencode": resolve_permissions_opencode}
 RESOLVERS["permissions"] = PERM_RESOLVERS
 
 

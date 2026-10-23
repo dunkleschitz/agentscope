@@ -293,9 +293,9 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.3.0", r.stdout)
+        self.assertIn("1.4.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
-        for h in ("codex", "claude", "cursor", "copilot", "gemini"):
+        for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode"):
             self.assertIn(h, r.stdout)
 
 
@@ -679,13 +679,20 @@ class HooksTests(Base):
         self.assertTrue(any("merged" in n for n in
                             full["harnesses"][0]["notes"]))
 
-    def test_gemini_empty_with_note(self):
+    def test_gemini_hooks_documented_not_modeled(self):
+        # the stale v1.2.0 note said no hook mechanism existed; the Gemini
+        # CLI hooks reference (geminicli.com/docs/hooks/) is real — the
+        # honest note now says documented-but-not-modeled.
         root, home = self.tree({})
         r = self.tool(home, "--hooks", "--harness", "gemini", "--json", root)
         self.assertEqual(r.returncode, 1)
         g = json.loads(r.stdout)["harnesses"][0]
         self.assertEqual(g["hooks"], [])
-        self.assertTrue(any("no documented hook" in n for n in g["notes"]))
+        self.assertTrue(any("HAS a documented hook mechanism" in n
+                            for n in g["notes"]))
+        self.assertTrue(any("geminicli.com/docs/hooks/" in n
+                            for n in g["notes"]))
+        self.assertTrue(any("hooktest" in n for n in g["notes"]))
 
     def test_exit_codes_and_text(self):
         root, home = self.tree(self.claude_struct())
@@ -724,7 +731,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.3.0")
+        self.assertEqual(body["version"], "1.4.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",
@@ -925,3 +932,134 @@ class PermissionsTests(Base):
         rule = cl["rules"][0]
         for k in ("kind", "rule", "source", "scope", "via", "tag", "note"):
             self.assertIn(k, rule)
+
+
+class OpencodeTests(Base):
+    def test_first_match_wins(self):
+        # AGENTS.md shadows CLAUDE.md at the same level [documented]
+        root, home = self.tree({
+            "AGENTS.md": "# agents\n", "CLAUDE.md": "# claude\n",
+        })
+        r = self.tool(home, "--harness", "opencode", "--json", root)
+        self.assertEqual(r.returncode, 0)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, "AGENTS.md")])
+        self.assertTrue(any("shadows" in x["via"] for x in c["contributors"]))
+
+    def test_claude_only_level_used(self):
+        root, home = self.tree({"sub/CLAUDE.md": "# claude-only\n"})
+        r = self.tool(home, "--harness", "opencode", "--json",
+                      os.path.join(root, "sub"))
+        self.assertEqual(r.returncode, 0)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(root, "sub", "CLAUDE.md"), paths)
+
+    def test_global_precedence_over_compat(self):
+        root, home = self.tree({"AGENTS.md": "# root\n"})
+        os.makedirs(os.path.join(home, ".config", "opencode"))
+        open(os.path.join(home, ".config", "opencode", "AGENTS.md"),
+             "w").write("# global\n")
+        os.makedirs(os.path.join(home, ".claude"))
+        open(os.path.join(home, ".claude", "CLAUDE.md"), "w").write("# compat\n")
+        r = self.tool(home, "--harness", "opencode", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(home, ".config", "opencode", "AGENTS.md"),
+                      paths)
+        self.assertNotIn(os.path.join(home, ".claude", "CLAUDE.md"), paths)
+        self.assertTrue(any("takes precedence" in n for n in c["notes"]))
+
+    def test_compat_fallback(self):
+        root, home = self.tree({"AGENTS.md": "# root\n"})
+        os.makedirs(os.path.join(home, ".claude"))
+        open(os.path.join(home, ".claude", "CLAUDE.md"), "w").write("# compat\n")
+        r = self.tool(home, "--harness", "opencode", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(home, ".claude", "CLAUDE.md"), paths)
+        self.assertTrue(any("compat fallback" in x["via"]
+                            for x in c["contributors"]))
+
+    def test_compat_disabled_via_env(self):
+        root, home = self.tree({"AGENTS.md": "# root\n"})
+        os.makedirs(os.path.join(home, ".claude"))
+        open(os.path.join(home, ".claude", "CLAUDE.md"), "w").write("# compat\n")
+        env = dict(os.environ, HOME=home, OPENCODE_DISABLE_CLAUDE_CODE="1")
+        r = subprocess.run([sys.executable, TOOL, "--harness", "opencode",
+                            "--json", root], capture_output=True, text=True,
+                           env=env)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertNotIn(os.path.join(home, ".claude", "CLAUDE.md"), paths)
+        self.assertTrue(any("disabled via env" in n for n in c["notes"]))
+
+    def test_instructions_entries(self):
+        root, home = self.tree({
+            "opencode.json": json.dumps({"instructions": [
+                "docs/team.md", "pkg/*/*.md",
+                "https://example.com/remote.md", "missing-file.md"]}),
+            "docs/team.md": "# team\n",
+            "pkg/a/rules.md": "# a\n", "pkg/b/rules.md": "# b\n",
+        })
+        r = self.tool(home, "--harness", "opencode", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(root, "docs", "team.md"), paths)
+        self.assertIn(os.path.join(root, "pkg", "a", "rules.md"), paths)
+        self.assertIn(os.path.join(root, "pkg", "b", "rules.md"), paths)
+        self.assertTrue(any("remote" in w and "NOT fetched" in w
+                            for w in c["warnings"]))
+        self.assertTrue(any("matched nothing" in w for w in c["warnings"]))
+
+    def test_upward_opencode_json_discovery(self):
+        root, home = self.tree({
+            "opencode.json": json.dumps({"instructions": ["rules.md"]}),
+            "rules.md": "# rules\n", "deep/deeper/": None,
+        })
+        r = self.tool(home, "--harness", "opencode", "--json",
+                      os.path.join(root, "deep", "deeper"))
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(root, "rules.md"), paths)
+
+    def test_no_import_expansion(self):
+        # opencode does not parse @file references [documented] — the
+        # referenced file must NOT be followed.
+        root, home = self.tree({
+            "AGENTS.md": "See @other.md for details\n", "other.md": "# o\n",
+        })
+        r = self.tool(home, "--harness", "opencode", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, "AGENTS.md")])
+
+    def test_empty_dirs_exit_1(self):
+        root, home = self.tree({"sub/": None})
+        r = self.tool(home, "--harness", "opencode",
+                      os.path.join(root, "sub"))
+        self.assertEqual(r.returncode, 1)
+
+    def test_mcp_and_permissions_notes(self):
+        root, home = self.tree({"AGENTS.md": "# root\n"})
+        r = self.tool(home, "--mcp", "--harness", "opencode", "--json", root)
+        m = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(m["servers"], [])
+        self.assertTrue(m["notes"])
+        r = self.tool(home, "--permissions", "--harness", "opencode",
+                      "--json", root)
+        p = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(p["rules"], [])
+        self.assertTrue(any("last-match-wins" in n for n in p["notes"]))
+
+    def test_diff_harness(self):
+        root, home = self.tree({"AGENTS.md": "# root\n",
+                                "CLAUDE.md": "# claude-only\n"})
+        r = self.tool(home, "--diff-harness", "claude", "opencode",
+                      "--json", root)
+        self.assertEqual(r.returncode, 0)
+        body = json.loads(r.stdout)
+        self.assertEqual(body["what"], "instruction files")
+        # claude merges upward (both files); opencode takes first match
+        self.assertIn(os.path.join(root, "CLAUDE.md"), body["only_in_a"])

@@ -1,5 +1,34 @@
 # CHANGELOG — agentscope
 
+## 1.4.0 (2026-10-22)
+
+Sixth harness: `--harness opencode` (instructions mode). Resolves the
+effective instruction set for OpenCode from vendor docs verified
+2026-10-22 (opencode.ai/docs/rules/, the page itself updated the day
+before the check). Genuinely different semantics from the other five
+harnesses: **first-match-wins per directory** (AGENTS.md shadows
+CLAUDE.md; not concatenation); global `~/.config/opencode/AGENTS.md`;
+`~/.claude/CLAUDE.md` Claude Code compat fallback gated by the
+documented `OPENCODE_DISABLE_CLAUDE_CODE*` env vars (checked for real);
+project/global `opencode.json` `instructions` entries — paths, globs,
+and remote URLs, with remotes listed-but-never-fetched (read-only) and
+missing/glob-miss entries warned; the nearest `opencode.json` upward is
+used (the upward search is [inferred]); no `@file` import expansion
+(the harness does not parse file references — [documented]). The
+read-time "nearer instruction file attached as a system reminder"
+behavior is dynamic per-read and reported as a note, never claimed as
+static output. --mcp/--hooks/--permissions for opencode resolve empty
+with honest notes (OpenCode's permission system — glob → allow/ask/deny,
+last-match-wins — is documented but not yet modeled). 84 tests (11 new
+opencode + a rewritten gemini-hooks test).
+
+Also fixed in this release: the `--hooks` note for Gemini CLI claimed
+(no evidence) that no hook mechanism existed; the official Gemini CLI
+hooks reference (geminicli.com/docs/hooks/, 11 events) is real, so the
+note now says documented-but-not-modeled and points at
+`hooktest --harness gemini` (v1.3.0, built the same day). The stale-model
+claim existed since v1.2.0 — a reminder to re-verify, not just label.
+
 ## 1.3.0 (2026-10-22)
 
 `--permissions` mode: effective allow/deny rule resolution per harness

@@ -54,7 +54,7 @@ import os
 import re
 import sys
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 RULES_VERIFIED = "2026-10-23"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -71,7 +71,7 @@ CODEX_CAP_DEFAULT = 32 * 1024  # [documented] project_doc_max_bytes default
 CLAUDE_IMPORT_HOPS = 4        # [documented] per Claude Code memory docs (via guides)
 
 HARNESSES = ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
-             "antigravity", "cline")
+             "antigravity", "cline", "roo")
 ALIASES = {"claude-code": "claude"}
 
 
@@ -1320,11 +1320,159 @@ def resolve_cline(d):
     return res
 
 
+# --------------------------------------------------------------------------
+# Roo Code (v1.9.0) — instructions mode.
+# Verified 2026-10-23 vs roocodeinc.github.io/Roo-Code/features/custom-modes/
+# (official; crawled 2026-10-23).
+# --------------------------------------------------------------------------
+
+# [documented] Roo Code reads rule dirs recursively and appends files in
+# alphabetical order by filename (case-insensitive), excluding system files
+# (.DS_Store, .swp, etc.) and cache files. The docs' "cache files" category
+# is vague, so the resolver excludes only the explicitly documented names
+# plus vim swap files — never claimed to be the harness's full set.
+_ROO_SYS_NAMES = frozenset((".DS_Store",))
+_ROO_SYS_SUFFIXES = (".swp", ".swo")
+_ROO_RULE_EXTS = (".md", ".txt")
+
+
+def _roo_rule_files(root):
+    """Rule files under a .roo rules dir, in the harness's documented order.
+
+    Recursive walk, alphabetical by filename (case-insensitive), .md/.txt
+    only, system/swap files excluded. The order and exclusions are
+    [documented] for the mode-specific dirs; applying the same walk to the
+    shared .roo/rules/ dirs is [inferred].
+    """
+    out = []
+    for cur, _dirs, files in os.walk(root):
+        for f in files:
+            if f in _ROO_SYS_NAMES or f.endswith(_ROO_SYS_SUFFIXES):
+                continue
+            if f.endswith(_ROO_RULE_EXTS):
+                out.append(os.path.join(cur, f))
+    out.sort(key=lambda p: (os.path.basename(p).lower(), p))
+    return out
+
+
+def resolve_roo(d, roo_mode=None):
+    """Roo Code instruction resolution.
+
+    Verified 2026-10-23 vs the OFFICIAL custom-modes docs
+    (roocodeinc.github.io/Roo-Code/features/custom-modes/).
+    Scopes:
+      - shared rules across all modes: {workspace}/.roo/rules/
+        [documented]; the global ~/.roo/rules/ is [inferred] from the
+        documented global scope (~/.roo/rules-{slug}/ for global modes)
+        combined with the documented generic shared dir;
+      - mode rules for --roo-mode SLUG: {workspace}/.roo/rules-{slug}/
+        (preferred: recursive, alphabetical case-insensitive, .md/.txt,
+        system files excluded), single-file fallback .roorules-{slug} in
+        the workspace root when the dir is missing or empty, and the
+        legacy .clinerules-{slug} additional fallback [all documented].
+        A non-empty mode dir SHADOWS that mode's single-file fallbacks
+        [documented]; the legacy .roorules (no slug) fallback for the
+        shared dir is community-documented [inferred].
+    DIR is treated as the workspace root — the docs define mode rule dirs
+    "in your workspace root", and no upward walk is documented [inferred].
+    The active mode is a runtime choice (the VS Code mode switcher / the
+    switch_mode tool): without --roo-mode only the shared rules resolve
+    and the gap is flagged in notes, never guessed. Mode tool permissions
+    (read/edit/command/mcp groups, fileRegex) and roleDefinition/
+    customInstructions live in the mode configs (custom_modes.yaml /
+    .roomodes), not in rule files, and are not modeled. Strictly read-only.
+    """
+    res = new_resolution("roo")
+    h = home()
+    ws = os.path.abspath(d)
+    # 1. global shared rules (baseline)
+    gdir = os.path.join(h, ".roo", "rules")
+    if os.path.isdir(gdir):
+        for p in _roo_rule_files(gdir):
+            add_file(res, p, "global",
+                     "[inferred] global shared rules (~/.roo/rules/): the "
+                     "docs scope global mode dirs to ~/.roo/ and name "
+                     ".roo/rules/ the generic shared dir")
+    # 2. workspace shared rules
+    wdir = os.path.join(ws, ".roo", "rules")
+    wfiles = _roo_rule_files(wdir) if os.path.isdir(wdir) else []
+    for p in wfiles:
+        add_file(res, p, "project-rule",
+                 "[documented] shared rules across all modes (.roo/rules/); "
+                 "the recursive alphabetical walk follows the documented "
+                 "mode-dir loading semantics [inferred]")
+    if not wfiles:
+        legacy = os.path.join(ws, ".roorules")
+        if non_empty(legacy):
+            add_file(res, legacy, "project-rule",
+                     "[inferred] legacy .roorules fallback: loads only when "
+                     ".roo/rules/ is missing or empty")
+    # 3. mode-specific rules — only when the mode is named
+    if roo_mode:
+        slug = roo_mode
+        if not re.match(r"^[A-Za-z0-9-]+$", slug):
+            res["notes"].append(
+                "[documented] --roo-mode %r does not match Roo Code's "
+                "documented slug pattern /^[a-zA-Z0-9-]+$/ — the harness "
+                "would never activate a mode with this slug" % slug)
+        gmdir = os.path.join(h, ".roo", "rules-" + slug)
+        if os.path.isdir(gmdir):
+            for p in _roo_rule_files(gmdir):
+                add_file(res, p, "mode",
+                         "[documented] global mode rules "
+                         "(~/.roo/rules-%s/)" % slug)
+        wmdir = os.path.join(ws, ".roo", "rules-" + slug)
+        mfiles = _roo_rule_files(wmdir) if os.path.isdir(wmdir) else []
+        for p in mfiles:
+            add_file(res, p, "mode",
+                     "[documented] mode rules for %r — directory method "
+                     "preferred: recursive, alphabetical (case-insensitive), "
+                     ".md/.txt, system files excluded" % slug)
+        if not mfiles:
+            for name, extra in ((".roorules-" + slug, ""),
+                                (".clinerules-" + slug,
+                                 " (legacy, backward compat)")):
+                fp = os.path.join(ws, name)
+                if non_empty(fp):
+                    add_file(res, fp, "mode",
+                             "[documented]%s single-file fallback — loads "
+                             "only when the mode's rules dir is missing or "
+                             "empty" % extra)
+        else:
+            res["notes"].append(
+                "[documented] .roo/rules-%s/ exists and contains files, so "
+                "the .roorules-%s / .clinerules-%s fallbacks are ignored by "
+                "the harness" % (slug, slug, slug))
+    else:
+        res["notes"].append(
+            "[inferred] no --roo-mode given: mode-specific rules cannot be "
+            "resolved — the active mode is a runtime choice (the VS Code "
+            "mode switcher / switch_mode tool), never guessed from disk. "
+            "Pass --roo-mode <slug> (e.g. code, architect, ask, debug, "
+            "orchestrator) to include them.")
+    res["notes"].append(
+        "[documented] DIR is treated as the workspace root: the docs define "
+        "mode rule dirs 'in your workspace root' and describe no upward "
+        "walk [inferred] — rules above DIR are never loaded.")
+    res["notes"].append(
+        "[documented] mode tool permissions (read/edit/command/mcp groups, "
+        "fileRegex) and roleDefinition/customInstructions live in the mode "
+        "configs (custom_modes.yaml / .roomodes), not in rule files — "
+        "agentscope does not model them.")
+    res["notes"].append(
+        "[inferred] load order below: global shared, then workspace shared, "
+        "then mode-specific. Documented anchors: global scope loads before "
+        "project scope; a mode dir shadows its single-file fallbacks. Any "
+        "finer merge order is undocumented — positions within a scope "
+        "follow the documented alphabetical rule.")
+    return res
+
+
 INSTR_RESOLVERS = {"codex": resolve_codex, "claude": resolve_claude,
                    "cursor": resolve_cursor, "copilot": resolve_copilot,
                    "gemini": resolve_gemini, "opencode": resolve_opencode,
                    "antigravity": resolve_antigravity,
-                   "cline": resolve_cline}
+                   "cline": resolve_cline, "roo": resolve_roo}
 
 
 # --------------------------------------------------------------------------
@@ -1715,11 +1863,21 @@ def resolve_mcp_cline(d):
     return res
 
 
+def resolve_mcp_roo(d):
+    res = new_mcp_resolution("roo")
+    res["notes"].append(
+        "[inferred] Roo Code's MCP servers are configured in .roo/mcp.json "
+        "(project scope, per community templates) — the format is not "
+        "officially documented for static resolution, so --mcp is not "
+        "modeled for roo")
+    return res
+
+
 MCP_RESOLVERS = {"codex": resolve_mcp_codex, "claude": resolve_mcp_claude,
                  "cursor": resolve_mcp_cursor, "copilot": resolve_mcp_copilot,
                  "gemini": resolve_mcp_gemini, "opencode": resolve_mcp_opencode,
                  "antigravity": resolve_mcp_antigravity,
-                 "cline": resolve_mcp_cline}
+                 "cline": resolve_mcp_cline, "roo": resolve_mcp_roo}
 RESOLVERS = {"instructions": INSTR_RESOLVERS, "mcp": MCP_RESOLVERS}
 
 
@@ -2268,13 +2426,21 @@ def resolve_hooks_cline(d):
     return res
 
 
+def resolve_hooks_roo(d):
+    res = new_hook_resolution("roo")
+    res["notes"].append(
+        "[inferred] no documented hook mechanism found for Roo Code — "
+        "not modeled")
+    return res
+
+
 HOOK_RESOLVERS = {"codex": resolve_hooks_codex, "claude": resolve_hooks_claude,
                   "cursor": resolve_hooks_cursor,
                   "copilot": resolve_hooks_copilot,
                   "gemini": resolve_hooks_gemini,
                   "opencode": resolve_hooks_opencode,
                   "antigravity": resolve_hooks_antigravity,
-                  "cline": resolve_hooks_cline}
+                  "cline": resolve_hooks_cline, "roo": resolve_hooks_roo}
 RESOLVERS["hooks"] = HOOK_RESOLVERS
 
 # --------------------------------------------------------------------------
@@ -2517,6 +2683,16 @@ def resolve_permissions_cline(d):
     return res
 
 
+def resolve_permissions_roo(d):
+    res = new_perm_resolution("roo")
+    res["notes"].append(
+        "[documented] Roo Code tool permissions are per-mode config "
+        "(read/edit/command/mcp groups, fileRegex) in custom_modes.yaml / "
+        ".roomodes — there is no documented static allow/deny rule file "
+        "format, so --permissions is not modeled for roo")
+    return res
+
+
 PERM_RESOLVERS = {"codex": resolve_permissions_codex,
                   "claude": resolve_permissions_claude,
                   "cursor": resolve_permissions_cursor,
@@ -2524,7 +2700,8 @@ PERM_RESOLVERS = {"codex": resolve_permissions_codex,
                   "gemini": resolve_permissions_gemini,
                   "opencode": resolve_permissions_opencode,
                   "antigravity": resolve_permissions_antigravity,
-                  "cline": resolve_permissions_cline}
+                  "cline": resolve_permissions_cline,
+                  "roo": resolve_permissions_roo}
 RESOLVERS["permissions"] = PERM_RESOLVERS
 
 
@@ -2907,6 +3084,14 @@ def resolve_skills_cline(d):
     return res
 
 
+def resolve_skills_roo(d):
+    res = new_skill_resolution("roo")
+    res["notes"].append(
+        "[inferred] no documented Agent Skills directory found for Roo "
+        "Code — not modeled")
+    return res
+
+
 SKILLS_RESOLVERS = {"codex": resolve_skills_codex,
                     "claude": resolve_skills_claude,
                     "cursor": resolve_skills_cursor,
@@ -2914,7 +3099,8 @@ SKILLS_RESOLVERS = {"codex": resolve_skills_codex,
                     "gemini": resolve_skills_gemini,
                     "opencode": resolve_skills_opencode,
                     "antigravity": resolve_skills_antigravity,
-                    "cline": resolve_skills_cline}
+                    "cline": resolve_skills_cline,
+                    "roo": resolve_skills_roo}
 RESOLVERS["skills"] = SKILLS_RESOLVERS
 
 
@@ -3101,6 +3287,13 @@ def build_parser():
     ap.add_argument("--harness", action="append", default=[],
                     help="harness to resolve (%s); repeatable; default: all"
                     % ", ".join(HARNESSES))
+    ap.add_argument("--roo-mode", metavar="SLUG",
+                    help="Roo Code mode slug (e.g. code, architect, ask, "
+                         "debug, orchestrator): with --harness roo, resolve "
+                         "that mode's .roo/rules-<slug>/ on top of the "
+                         "shared rules. Without it only shared rules "
+                         "resolve — the active mode is a runtime choice "
+                         "and is never guessed.")
     ap.add_argument("--list-harnesses", action="store_true",
                     help="list supported harnesses and exit")
     ap.add_argument("--outline", action="store_true",
@@ -3139,6 +3332,15 @@ def normalize_harness(name):
     return n if n in HARNESSES else None
 
 
+def _resolve_one(mode_name, harness_name, d, roo_mode=None):
+    """Dispatch one resolution, carrying the Roo mode flag to resolve_roo.
+
+    resolve_roo takes (d, roo_mode); every other resolver takes (d)."""
+    if harness_name == "roo" and mode_name == "instructions":
+        return resolve_roo(d, roo_mode)
+    return RESOLVERS[mode_name][harness_name](d)
+
+
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -3172,8 +3374,8 @@ def main(argv=None):
                 print("agentscope: unknown harness: %s" % n, file=sys.stderr)
                 return 2
             names.append(nn)
-        ra = RESOLVERS[mode][names[0]](d)
-        rb = RESOLVERS[mode][names[1]](d)
+        ra = _resolve_one(mode, names[0], d, args.roo_mode)
+        rb = _resolve_one(mode, names[1], d, args.roo_mode)
         if mode == "mcp":
             sa = {s["name"] for s in ra["servers"]}
             sb = {s["name"] for s in rb["servers"]}
@@ -3232,7 +3434,11 @@ def main(argv=None):
                 names.append(nn)
     else:
         names = list(HARNESSES)
-    results = [RESOLVERS[mode][n](d) for n in names]
+    if args.roo_mode and "roo" not in names:
+        print("agentscope: --roo-mode only applies with --harness roo "
+              "(or all harnesses)", file=sys.stderr)
+        return 2
+    results = [_resolve_one(mode, n, d, args.roo_mode) for n in names]
     if args.json:
         if mode == "mcp":
             sys.stdout.write(render_mcp_json(results, d))

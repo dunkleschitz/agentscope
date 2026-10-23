@@ -1,6 +1,30 @@
 # CHANGELOG — agentscope
 
-## 1.8.0 (2026-10-23)
+## 1.9.0 (2026-10-23)
+
+Ninth harness: `--harness roo` (Roo Code — VS Code/Desktop/CLI agent),
+instructions mode, with a new `--roo-mode <slug>` flag. Rules verified
+2026-10-23 vs the official custom-modes docs
+(roocodeinc.github.io/Roo-Code/features/custom-modes/). Resolution:
+shared rules `~/.roo/rules/` + `{workspace}/.roo/rules/` (global scope
+loads first; recursive, alphabetical by filename case-insensitive,
+`.md`/`.txt`, `.DS_Store`/`.swp` excluded; legacy `.roorules` fallback
+when the workspace dir is missing or empty). Mode rules for the named
+slug: `~/.roo/rules-<slug>/` + `{workspace}/.roo/rules-<slug}/`
+(preferred), `.roorules-<slug>` then `.clinerules-<slug>` single-file
+fallbacks — a non-empty mode dir shadows them. Slugs outside the
+documented `/^[a-zA-Z0-9-]+$/` pattern are flagged. DIR is the workspace
+root (no upward walk — undocumented, `[inferred]`). The active mode is a
+runtime choice (VS Code mode switcher / `switch_mode`), so without
+`--roo-mode` only shared rules resolve and the gap is flagged, never
+guessed; `--roo-mode` with a non-roo harness is a usage error (exit 2).
+Mode tool permissions and `roleDefinition`/`customInstructions` live in
+`custom_modes.yaml`/`.roomodes` configs, not rule files — not modeled.
+`--mcp`/`--hooks`/`--permissions`/`--skills` resolve honestly empty with
+notes (no documented per-directory static mechanism; `.roo/mcp.json`
+noted as a future candidate). 14 new hermetic tests (154 total); one
+stale `1.8.0` version assertion in existing tests updated (tool correct).
+Dogfood: doccover 12/12 + clicheck 15/15 clean.
 
 Eighth harness: `--harness cline` (Cline — VS Code/Desktop/CLI agent),
 instructions mode. Rules verified 2026-10-23 vs the official docs

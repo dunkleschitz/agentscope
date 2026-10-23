@@ -293,10 +293,10 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.8.0", r.stdout)
+        self.assertIn("1.9.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
-            "antigravity"):
+            "antigravity", "cline", "roo"):
             self.assertIn(h, r.stdout)
 
 
@@ -851,7 +851,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.8.0")
+        self.assertEqual(body["version"], "1.9.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",
@@ -1798,3 +1798,169 @@ class ClineTests(Base):
             r = self.tool(home, mode, "--harness", "cline", root)
             self.assertEqual(r.returncode, 1)
             self.assertIn(fragment, r.stdout)
+
+
+class RooTests(Base):
+    def _global(self, home, struct):
+        for rel, content in struct.items():
+            p = os.path.join(home, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+
+    def _harness(self, home, *args):
+        r = self.tool(home, "--harness", "roo", "--json", *args)
+        self.assertEqual(r.returncode, 0)
+        return json.loads(r.stdout)["harnesses"][0]
+
+    def test_shared_global_before_workspace(self):
+        root, home = self.tree({".roo/rules/a.md": "# a\n"})
+        self._global(home, {".roo/rules/g.md": "# g\n"})
+        h = self._harness(home, root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [
+            os.path.join(home, ".roo", "rules", "g.md"),
+            os.path.join(root, ".roo", "rules", "a.md"),
+        ])
+        roles = [c["role"] for c in h["contributors"]]
+        self.assertEqual(roles, ["global", "project-rule"])
+
+    def test_mode_dir_shadows_single_file_fallbacks(self):
+        root, home = self.tree({
+            ".roo/rules-code/b.md": "# b\n",
+            ".roorules-code": "single\n",
+            ".clinerules-code": "legacy\n",
+        })
+        h = self._harness(home, "--roo-mode", "code", root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, ".roo", "rules-code", "b.md")])
+        self.assertTrue(any("ignored by the harness" in n for n in h["notes"]))
+
+    def test_fallback_chain_without_mode_dir(self):
+        root, home = self.tree({
+            ".roorules-code": "single\n",
+            ".clinerules-code": "legacy\n",
+        })
+        h = self._harness(home, "--roo-mode", "code", root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, ".roorules-code"),
+                                 os.path.join(root, ".clinerules-code")])
+        self.assertTrue(all(c["role"] == "mode" for c in h["contributors"]))
+
+    def test_empty_mode_dir_falls_back(self):
+        root, home = self.tree({
+            ".roo/rules-code/": None,
+            ".roorules-code": "single\n",
+        })
+        h = self._harness(home, "--roo-mode", "code", root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, ".roorules-code")])
+
+    def test_global_mode_dir(self):
+        root, home = self.tree({".roo/rules/a.md": "# a\n"})
+        self._global(home, {".roo/rules-debug/z.md": "# z\n"})
+        h = self._harness(home, "--roo-mode", "debug", root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, ".roo", "rules", "a.md"),
+                                 os.path.join(home, ".roo", "rules-debug",
+                                              "z.md")])
+        self.assertTrue(all(c["role"] in ("project-rule", "mode")
+                            for c in h["contributors"]))
+
+    def test_no_roo_mode_skips_mode_rules_with_note(self):
+        root, home = self.tree({
+            ".roo/rules/a.md": "# a\n",
+            ".roo/rules-code/b.md": "# b\n",
+        })
+        h = self._harness(home, root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, ".roo", "rules", "a.md")])
+        self.assertTrue(any("no --roo-mode given" in n for n in h["notes"]))
+
+    def test_system_files_excluded(self):
+        root, home = self.tree({
+            ".roo/rules-code/a.md": "# a\n",
+            ".roo/rules-code/.DS_Store": "junk\n",
+            ".roo/rules-code/x.swp": "junk\n",
+            ".roo/rules-code/n.txt": "plain\n",
+            ".roo/rules-code/s.yaml": "nope\n",
+        })
+        h = self._harness(home, "--roo-mode", "code", root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, ".roo", "rules-code",
+                                              "a.md"),
+                                 os.path.join(root, ".roo", "rules-code",
+                                              "n.txt")])
+
+    def test_alphabetical_case_insensitive_recursive(self):
+        root, home = self.tree({
+            ".roo/rules-code/B.md": "# B\n",
+            ".roo/rules-code/a.md": "# a\n",
+            ".roo/rules-code/sub/c.md": "# c\n",
+        })
+        h = self._harness(home, "--roo-mode", "code", root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [
+            os.path.join(root, ".roo", "rules-code", "a.md"),
+            os.path.join(root, ".roo", "rules-code", "B.md"),
+            os.path.join(root, ".roo", "rules-code", "sub", "c.md"),
+        ])
+
+    def test_legacy_roorules_fallback(self):
+        root, home = self.tree({".roorules": "old school\n"})
+        h = self._harness(home, root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [os.path.join(root, ".roorules")])
+
+    def test_invalid_slug_pattern_note(self):
+        root, home = self.tree({".roo/rules/a.md": "# a\n"})
+        h = self._harness(home, "--roo-mode", "BAD SLUG", root)
+        self.assertTrue(any("slug pattern" in n for n in h["notes"]))
+
+    def test_roo_mode_requires_roo_harness(self):
+        root, home = self.tree({".roo/rules/a.md": "# a\n"})
+        r = self.tool(home, "--harness", "claude", "--roo-mode", "code", root)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--roo-mode", r.stderr)
+
+    def test_dir_is_workspace_root_no_upward_walk(self):
+        root, home = self.tree({
+            ".roo/rules/a.md": "# parent\n",
+            "sub/": None,
+        })
+        r = self.tool(home, "--harness", "roo", "--json",
+                      os.path.join(root, "sub"))
+        self.assertEqual(r.returncode, 1)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["contributors"], [])
+        self.assertTrue(any("workspace root" in n for n in h["notes"]))
+
+    def test_other_modes_empty_with_honest_note(self):
+        root, home = self.tree({".roo/rules/a.md": "# a\n"})
+        expected = {
+            "--mcp": "so --mcp is not modeled for roo",
+            "--hooks": "no documented hook mechanism found for Roo Code",
+            "--permissions": "so --permissions is not modeled for roo",
+            "--skills": "no documented Agent Skills directory found for Roo",
+        }
+        for mode, fragment in expected.items():
+            r = self.tool(home, mode, "--harness", "roo", root)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn(fragment, r.stdout)
+
+    def test_tag_vocabulary(self):
+        root, home = self.tree({
+            ".roo/rules/a.md": "# a\n",
+            ".roo/rules-code/b.md": "# b\n",
+            ".roorules-debug": "single\n",
+        })
+        self._global(home, {".roo/rules/g.md": "# g\n",
+                            ".roo/rules-architect/z.md": "# z\n"})
+        for extra in ([], ["--roo-mode", "code"], ["--roo-mode", "debug"],
+                      ["--roo-mode", "BAD SLUG"]):
+            h = self._harness(home, *extra, root)
+            for c in h["contributors"]:
+                self.assertTrue("[documented]" in c["via"] or
+                                "[inferred]" in c["via"], c["path"])
+            for w in h["warnings"] + h["notes"]:
+                self.assertTrue("[documented]" in w or "[inferred]" in w, w)

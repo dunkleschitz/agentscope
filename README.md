@@ -239,6 +239,7 @@ Exit codes in `--skills` mode: **0** = at least one skill found;
 | `opencode` | **first-match-wins per directory** (AGENTS.md shadows CLAUDE.md — not concatenated like the others); global `~/.config/opencode/AGENTS.md`; `~/.claude/CLAUDE.md` compat fallback (disabled by `OPENCODE_DISABLE_CLAUDE_CODE*`); `opencode.json` `instructions` entries (paths, globs, remote URLs — remotes listed, never fetched); **no** `@file` import expansion (the harness doesn't parse them). `--mcp` reads the v2 `mcp.servers` layout; `--permissions` reads the `permissions` array |
 | `antigravity` (v1.6.0) | **cumulative** (not replacement-based): directory-scoped rules nearest-first — `<dir>/AGENTS.md`/`GEMINI.md`, `<dir>/.agents/AGENTS.md`/`GEMINI.md`, `<dir>/.agents/rules/*.md` (frontmatter `trigger`: `always_on`/`model_decision`/`glob`/`manual`; legacy `.agent/` honored), `.agents/rules.json` `inherits`/`entries` expansion — then global `~/.gemini/AGENTS.md`, `~/.gemini/GEMINI.md`, `~/.gemini/config/AGENTS.md`/`GEMINI.md`, `~/.gemini/config/rules/*.md`. 24 KB per-file truncation warning; `@[label](path)` includes listed (inlined by the harness, not expanded here). `--hooks` reads `.agents/hooks.json` (workspace, nearest upward) + `~/.gemini/config/hooks.json` (global): 6 events, matcher regexes, `enabled: false` honored, commands shown verbatim and **never executed**. `--mcp` reads `~/.gemini/config/mcp_config.json` (+ community-reported `.agents/mcp_config.json`). `--permissions` is honestly empty — permission rules are UI-managed (Settings), with the Deny/Ask/Allow model and presets documented in notes. Rules verified 2026-10-23 vs the official docs |
 | `cline` (v1.8.0) | global `~/Documents/Cline/Rules/*.md` + `~/.agents/AGENTS.md` (baseline, loaded first), then workspace: `.clinerules/` **and** `.cline/rules/` (both searched, combined; `.md`/`.txt` processed), auto-detected `.cursorrules`, `.windsurfrules`, `AGENTS.md` at the project root. **Combined, workspace wins on conflict**; the relative order of the workspace formats is undocumented (`[inferred]`). Conditional rules: YAML frontmatter `paths` globs scope a rule to matching files — activation is dynamic (open tabs, mentioned paths, edited files), reported structurally, never predicted; `paths: []` means never activates. Rule toggles are UI state (Rules panel), not files — assumed enabled, always noted. `.clinerules/` only works in the primary workspace folder (multi-root). Workspace rules are resolved at the project root; for a subdirectory agentscope walks upward to the nearest ancestor holding rule markers (`[inferred]`, walk stops at `$HOME`). `--mcp`/`--hooks`/`--permissions`/`--skills` are honestly empty with notes (no documented per-directory static mechanism). Rules verified 2026-10-23 vs docs.cline.bot/customization/cline-rules |
+| `roo` (v1.9.0) | Roo Code: shared rules `~/.roo/rules/` + `{workspace}/.roo/rules/` (recursive, alphabetical by filename case-insensitive, `.md`/`.txt`, `.DS_Store`/`.swp` excluded), legacy `.roorules` fallback when the workspace dir is missing/empty. Mode rules via **`--roo-mode <slug>`** (e.g. `--roo-mode code`; without it only shared rules resolve — the active mode is a runtime choice, never guessed): `~/.roo/rules-<slug>/` + `{workspace}/.roo/rules-<slug>/` (preferred method, same walk), `.roorules-<slug>` then `.clinerules-<slug>` single-file fallbacks — a non-empty mode dir shadows them. Slugs not matching `/^[a-zA-Z0-9-]+$/` are flagged. DIR is treated as the workspace root (no upward walk — undocumented, `[inferred]`). Mode tool permissions (`read`/`edit`/`command`/`mcp` groups, `fileRegex`) and `roleDefinition`/`customInstructions` live in `custom_modes.yaml`/`.roomodes`, not rule files — not modeled. `--mcp`/`--hooks`/`--permissions`/`--skills` are honestly empty with notes (no documented per-directory static mechanism). Rules verified 2026-10-23 vs the official custom-modes docs |
 
 ## The honesty model
 
@@ -284,11 +285,15 @@ session hinges on it, confirm against the harness's own docs.
   Cline have no documented static allow/deny format and resolve empty.
   Rule text is shown verbatim; treat the output as you would the config
   file itself.
+- Roo Code: without `--roo-mode` the mode-specific rule layer is
+  unresolvable (the active mode is runtime state, never guessed); mode
+  tool permissions and `roleDefinition`/`customInstructions` live in
+  `custom_modes.yaml`/`.roomodes` configs, not rule files — not modeled.
 
 ## Testing
 
 ```bash
-python3 -m unittest test_agentscope -v   # 140 tests
+python3 -m unittest test_agentscope -v   # 154 tests
 ```
 
 Stdlib only (Python 3.11+, for `tomllib`). No dependencies. Strictly

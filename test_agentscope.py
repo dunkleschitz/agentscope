@@ -293,9 +293,10 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.5.0", r.stdout)
+        self.assertIn("1.6.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
-        for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode"):
+        for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
+            "antigravity"):
             self.assertIn(h, r.stdout)
 
 
@@ -850,7 +851,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.5.0")
+        self.assertEqual(body["version"], "1.6.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",
@@ -1279,3 +1280,178 @@ class OpencodePermissionsTests(Base):
         self.assertEqual(body["rules"], [])
         self.assertTrue(any("no `permissions` array" in n
                             for n in body["notes"]))
+
+
+class AntigravityTests(Base):
+    HOOKS_JSON = json.dumps({
+        "my-linter": {
+            "PreToolUse": [
+                {"matcher": "run_command",
+                 "hooks": [{"type": "command",
+                            "command": "./scripts/lint.sh",
+                            "timeout": 10}]}
+            ],
+            "SessionStart": [
+                {"hooks": [{"command": "./scripts/init.sh"}]}
+            ],
+        },
+        "off": {"enabled": False,
+                "PreToolUse": [{"hooks": [{"command": "nope.sh"}]}]},
+        "weird": {"NoSuchEvent": [{"hooks": [{"command": "x.sh"}]}]},
+    })
+
+    def test_instructions_cumulative(self):
+        # AGENTS.md + .agents/rules/*.md + GEMINI.md all contribute
+        root, home = self.tree({
+            "AGENTS.md": "# root\n",
+            "sub/GEMINI.md": "# gem\n",
+            ".agents/rules/py.md":
+                "---\ntrigger: glob\nglobs: \"*.py\"\n"
+                "description: \"py rules\"\n---\n# py\n",
+        })
+        r = self.tool(home, "--harness", "antigravity", "--json",
+                      os.path.join(root, "sub"))
+        self.assertEqual(r.returncode, 0)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(root, "AGENTS.md"), paths)
+        self.assertIn(os.path.join(root, "sub", "GEMINI.md"), paths)
+        self.assertIn(os.path.join(root, ".agents", "rules", "py.md"), paths)
+        by_path = {x["path"]: x for x in c["contributors"]}
+        self.assertIn("trigger=glob", by_path[
+            os.path.join(root, ".agents", "rules", "py.md")]["via"])
+
+    def test_global_rules(self):
+        root, home = self.tree({})
+        os.makedirs(os.path.join(home, ".gemini", "config", "rules"))
+        open(os.path.join(home, ".gemini", "AGENTS.md"),
+             "w").write("# g\n")
+        open(os.path.join(home, ".gemini", "config", "rules", "r.md"),
+             "w").write("---\ntrigger: always_on\n---\n# r\n")
+        r = self.tool(home, "--harness", "antigravity", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(home, ".gemini", "AGENTS.md"), paths)
+        self.assertIn(os.path.join(home, ".gemini", "config", "rules", "r.md"),
+                      paths)
+        by_path = {x["path"]: x for x in c["contributors"]}
+        self.assertIn("trigger=always_on", by_path[
+            os.path.join(home, ".gemini", "config", "rules", "r.md")]["via"])
+
+    def test_legacy_agent_dir(self):
+        root, home = self.tree({".agent/rules/old.md": "# old\n"})
+        r = self.tool(home, "--harness", "antigravity", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(root, ".agent", "rules", "old.md"), paths)
+
+    def test_rules_json_expansion(self):
+        root, home = self.tree({
+            ".agents/rules.json": json.dumps({
+                "entries": [{"path": "../shared",
+                             "exclude": ["skip.md"]}]}),
+            "shared/a.md": "# a\n",
+            "shared/skip.md": "# skip\n",
+        })
+        r = self.tool(home, "--harness", "antigravity", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        paths = [x["path"] for x in c["contributors"]]
+        self.assertIn(os.path.join(root, "shared", "a.md"), paths)
+        self.assertNotIn(os.path.join(root, "shared", "skip.md"), paths)
+
+    def test_oversize_rule_warns(self):
+        root, home = self.tree({"AGENTS.md": "x" * 25000})
+        r = self.tool(home, "--harness", "antigravity", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        self.assertTrue(any("24,000-byte" in w for w in c["warnings"]))
+
+    def test_include_refs_noted_not_expanded(self):
+        root, home = self.tree({
+            "AGENTS.md": "# r\n\n@[API](../docs/api.md)\n",
+        })
+        r = self.tool(home, "--harness", "antigravity", "--json", root)
+        c = json.loads(r.stdout)["harnesses"][0]
+        self.assertTrue(any("@[label](path)" in n and "../docs/api.md" in n
+                            for n in c["notes"]))
+
+    def test_hooks_resolution(self):
+        root, home = self.tree({
+            ".agents/hooks.json": self.HOOKS_JSON,
+        })
+        os.makedirs(os.path.join(home, ".gemini", "config"))
+        open(os.path.join(home, ".gemini", "config", "hooks.json"),
+             "w").write(json.dumps({
+                 "g": {"Stop": [{"hooks": [{"command": "/g/stop.sh"}]}]}}))
+        r = self.tool(home, "--hooks", "--harness", "antigravity",
+                      "--json", root)
+        self.assertEqual(r.returncode, 0)
+        body = json.loads(r.stdout)
+        hks = body["harnesses"][0]["hooks"]
+        by_key = {(h["event"], h["matcher"]): h for h in hks}
+        self.assertIn(("PreToolUse", "run_command"), by_key)
+        self.assertEqual(by_key[("PreToolUse", "run_command")]["command"],
+                         "./scripts/lint.sh")
+        self.assertEqual(by_key[("PreToolUse", "run_command")]["timeout"], 10)
+        self.assertIn(("SessionStart", ""), by_key)
+        self.assertIn(("Stop", ""), by_key)
+        # enabled:false skipped, unknown event warned
+        self.assertFalse(any(h["command"] == "nope.sh" for h in hks))
+        self.assertTrue(any("NoSuchEvent" in w
+                            for w in body["harnesses"][0]["warnings"]))
+        self.assertTrue(any("decision" in n
+                            for n in body["harnesses"][0]["notes"]))
+
+    def test_hooks_never_execute(self):
+        marker = os.path.join(tempfile.gettempdir(),
+                              "ag-never-exec-%d" % os.getpid())
+        root, home = self.tree({
+            ".agents/hooks.json": json.dumps({
+                "evil": {"PreToolUse": [
+                    {"hooks": [{"command": "touch %s" % marker}]}]}}),
+        })
+        r = self.tool(home, "--hooks", "--harness", "antigravity",
+                      "--json", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(marker),
+                         "agentscope executed a hook command")
+        if os.path.exists(marker):
+            os.unlink(marker)
+
+    def test_mcp_global_and_secret_safety(self):
+        root, home = self.tree({})
+        os.makedirs(os.path.join(home, ".gemini", "config"))
+        open(os.path.join(home, ".gemini", "config", "mcp_config.json"),
+             "w").write(json.dumps({"mcpServers": {
+                 "dd": {"serverUrl": "https://x.test/mcp?token=SECRET",
+                        "headers": {"X-Key": "hunter2"}},
+                 "loc": {"command": "/bin/srv", "args": ["--x"],
+                         "env": {"API_KEY": "hunter2"}}}}))
+        r = self.tool(home, "--mcp", "--harness", "antigravity",
+                      "--json", root)
+        self.assertEqual(r.returncode, 0)
+        body = json.loads(r.stdout)
+        srvs = {s["name"]: s for s in body["harnesses"][0]["servers"]}
+        self.assertEqual(srvs["dd"]["transport"], "http")
+        self.assertNotIn("SECRET", json.dumps(srvs))
+        self.assertNotIn("hunter2", json.dumps(srvs))
+        self.assertEqual(srvs["dd"]["headers"], {"X-Key": "<set>"})
+        self.assertEqual(srvs["loc"]["env"], {"API_KEY": "<set>"})
+        self.assertEqual(srvs["loc"]["command"], "/bin/srv")
+
+    def test_permissions_honest_empty(self):
+        root, home = self.tree({})
+        r = self.tool(home, "--permissions", "--harness", "antigravity",
+                      "--json", root)
+        body = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(body["rules"], [])
+        self.assertTrue(any("UI-managed" in n for n in body["notes"]))
+        self.assertTrue(any("PreToolUse" in n for n in body["notes"]))
+
+    def test_diff_harness_includes_antigravity(self):
+        root, home = self.tree({"AGENTS.md": "# a\n"})
+        r = self.tool(home, "--diff-harness", "claude", "antigravity",
+                      "--json", root)
+        self.assertEqual(r.returncode, 0)
+        body = json.loads(r.stdout)
+        self.assertEqual(body["a"], "claude")
+        self.assertEqual(body["b"], "antigravity")

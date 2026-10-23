@@ -52,7 +52,7 @@ import os
 import re
 import sys
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 RULES_VERIFIED = "2026-10-22"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -68,7 +68,8 @@ MAX_IMPORT_DEPTH = 5          # [inferred] default recursion cap for @-imports
 CODEX_CAP_DEFAULT = 32 * 1024  # [documented] project_doc_max_bytes default
 CLAUDE_IMPORT_HOPS = 4        # [documented] per Claude Code memory docs (via guides)
 
-HARNESSES = ("codex", "claude", "cursor", "copilot", "gemini", "opencode")
+HARNESSES = ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
+             "antigravity")
 ALIASES = {"claude-code": "claude"}
 
 
@@ -715,9 +716,425 @@ def resolve_opencode(d):
     return res
 
 
+# --------------------------------------------------------------------------
+# Antigravity (v1.6.0) — Google's agent IDE/CLI/App.
+#
+# Rules verified 2026-10-23 against the OFFICIAL docs:
+#   instructions: antigravity.google/docs/rules/
+#   hooks:        antigravity.google/docs/hooks/
+#   permissions:  antigravity.google/docs/permissions/
+# MCP global config: ~/.gemini/config/mcp_config.json [documented in
+# Google Cloud docs + multiple guides]; project-level
+# .agents/mcp_config.json is community-reported, tagged [inferred].
+
+ANTIGRAVITY_RULE_FILE_LIMIT = 24000  # bytes; harness truncates above it
+ANTIGRAVITY_HOOK_EVENTS = ("SessionStart", "PreToolUse", "PostToolUse",
+                           "PreInvocation", "PostInvocation", "Stop")
+
+
+def _ag_frontmatter(path):
+    """Parse the tiny frontmatter of a rules/*.md file -> dict.
+
+    Only the documented keys (trigger, description, globs/glob); a real
+    YAML parser is overkill and this never executes anything.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return {}
+    m = re.match(r"\s*---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(\r?\n|$)",
+                 head, re.S)
+    if not m:
+        return {}
+    fm = {}
+    for line in m.group(1).splitlines():
+        mm = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$", line)
+        if mm:
+            v = mm.group(2)
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            fm[mm.group(1)] = v
+    return fm
+
+
+def _ag_rules_json_files(agents_dir, res, _depth=0):
+    """Expand .agents/rules.json inherits/entries -> [(path, via-note)].
+
+    [documented] shape; entry paths are resolved relative to the .agents
+    dir [inferred]. Recursion capped at 3.
+    """
+    if _depth > 3:
+        res["warnings"].append(
+            ".agents/rules.json inherits nesting deeper than 3 at %s; "
+            "stopped [inferred]" % agents_dir)
+        return []
+    cfg_path = os.path.join(agents_dir, "rules.json")
+    obj = read_json_obj(cfg_path)
+    if obj is None:
+        return []
+    out = []
+    for inh in obj.get("inherits") or []:
+        ip = inh.get("path") if isinstance(inh, dict) else None
+        if not ip:
+            continue
+        target = os.path.normpath(os.path.join(agents_dir, ip))
+        parent = os.path.dirname(target)
+        if os.path.basename(target) == "rules.json" and os.path.isdir(parent):
+            out.extend(_ag_rules_json_files(parent, res, _depth + 1))
+        else:
+            res["warnings"].append(
+                "rules.json inherits entry %r does not resolve to a "
+                "rules.json file; skipped [inferred]" % ip)
+    for entry in obj.get("entries") or []:
+        if not isinstance(entry, dict) or not entry.get("path"):
+            continue
+        base = os.path.normpath(os.path.join(agents_dir, entry["path"]))
+        if not os.path.isdir(base):
+            res["warnings"].append(
+                "rules.json entry path %r matched nothing; skipped "
+                "[inferred]" % entry["path"])
+            continue
+        exclude = set(entry.get("exclude") or [])
+        only = entry.get("include_only")
+        for root, _dirs, files in os.walk(base):
+            for fn in sorted(files):
+                if not fn.endswith(".md"):
+                    continue
+                rel = os.path.relpath(os.path.join(root, fn), base)
+                if rel in exclude or fn in exclude:
+                    continue
+                if only and rel not in only and fn not in only:
+                    continue
+                out.append((os.path.join(root, fn),
+                            "[documented] .agents/rules.json entry %r "
+                            "([inferred] paths relative to the .agents "
+                            "dir)" % entry["path"]))
+    return out
+
+
+def _ag_add_rule_file(res, path, scope, via_extra=""):
+    if not non_empty(path):
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    if size > ANTIGRAVITY_RULE_FILE_LIMIT:
+        res["warnings"].append(
+            "%s is %d bytes > the 24,000-byte per-file limit: the harness "
+            "truncates it (cutoff estimated, never claimed exact) "
+            "[documented]" % (path, size))
+    fm = _ag_frontmatter(path)
+    via = "[documented] Antigravity rule file"
+    if fm.get("trigger"):
+        via += "; trigger=%s" % fm["trigger"]
+        if fm.get("description"):
+            via += "; description=%r" % fm["description"][:60]
+        globs = fm.get("globs") or fm.get("glob")
+        if globs:
+            via += "; globs=%r" % globs
+    elif os.path.basename(os.path.dirname(path)) == "rules":
+        via += ("; NO frontmatter trigger — the harness requires one for "
+                "rules/ files, this file may be ignored [documented]")
+    if via_extra:
+        via += "; " + via_extra
+    add_file(res, path, scope, via)
+    # @[label](path) includes are inlined by the harness (relative to the
+    # rule file; frontmatter stripped) [documented]. Listed, not expanded.
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(200000)
+    except OSError:
+        return
+    incs = sorted(set(re.findall(r"@\[[^\]]*\]\(([^)]+)\)", text)))
+    if incs:
+        res["notes"].append(
+            "[documented] %s references %d @[label](path) include(s), "
+            "inlined by the harness relative to the rule file: %s"
+            % (path, len(incs), ", ".join(incs)))
+
+
+def resolve_antigravity(d):
+    """Antigravity instruction resolution.
+
+    Verified 2026-10-23 vs antigravity.google/docs/rules/ (official).
+    Cumulative, not replacement-based; precedence highest to lowest:
+      1. directory-scoped rules, nearest directory winning on conflict:
+         <dir>/AGENTS.md | <dir>/GEMINI.md, <dir>/.agents/AGENTS.md |
+         <dir>/.agents/GEMINI.md, <dir>/.agents/rules/*.md (plus legacy
+         <dir>/.agent/rules/*.md) [documented];
+      2. global rules: ~/.gemini/AGENTS.md, ~/.gemini/GEMINI.md,
+         ~/.gemini/config/AGENTS.md, ~/.gemini/config/GEMINI.md
+         (standalone, no frontmatter, always_on) and
+         ~/.gemini/config/rules/*.md (frontmatter trigger required)
+         [documented].
+    Triggers: always_on | model_decision | glob | manual [documented].
+    24,000-byte per-file limit (truncated) and a 20,000-token aggregate
+    budget after which the largest rules demote to pointers [documented].
+    @[label](path) includes are inlined relative to the rule file
+    [documented]. .agents/rules.json inherits/entries share rule dirs
+    [documented shape; relative-root inferred]. Strictly read-only.
+    """
+    res = new_resolution("antigravity")
+    h = home()
+    res["notes"].append(
+        "[documented] precedence (highest to lowest): directory-scoped "
+        "rules (nearest directory wins on conflict), then global rules; "
+        "cumulative, not replacement-based. Rules verified 2026-10-23 vs "
+        "antigravity.google/docs/rules/")
+    # 1. directory-scoped: walk from DIR upward
+    for level in upward(d):
+        for name in ("AGENTS.md", "GEMINI.md"):
+            _ag_add_rule_file(
+                res, os.path.join(level, name), "project",
+                "no frontmatter; always_on for this scope")
+        for adir_name in (".agents", ".agent"):  # .agent = legacy
+            adir = os.path.join(level, adir_name)
+            for name in ("AGENTS.md", "GEMINI.md"):
+                _ag_add_rule_file(
+                    res, os.path.join(adir, name), "project",
+                    "%s/%s; always_on" % (adir_name, name))
+            rules_dir = os.path.join(adir, "rules")
+            if os.path.isdir(rules_dir):
+                for fn in sorted(os.listdir(rules_dir)):
+                    if fn.endswith(".md"):
+                        _ag_add_rule_file(
+                            res, os.path.join(rules_dir, fn), "rule",
+                            "%s/rules/%s" % (adir_name, fn))
+            for rp, rvia in _ag_rules_json_files(adir, res):
+                _ag_add_rule_file(res, rp, "rule", rvia)
+    # 2. global
+    for gp in (os.path.join(h, ".gemini", "AGENTS.md"),
+               os.path.join(h, ".gemini", "GEMINI.md"),
+               os.path.join(h, ".gemini", "config", "AGENTS.md"),
+               os.path.join(h, ".gemini", "config", "GEMINI.md")):
+        _ag_add_rule_file(res, gp, "global",
+                          "standalone global file; always_on")
+    grules = os.path.join(h, ".gemini", "config", "rules")
+    if os.path.isdir(grules):
+        for fn in sorted(os.listdir(grules)):
+            if fn.endswith(".md"):
+                _ag_add_rule_file(
+                    res, os.path.join(grules, fn), "rule",
+                    "modular global rule (frontmatter trigger required)")
+    res["notes"].append(
+        "[documented] 20,000-token aggregate rules budget: when exceeded, "
+        "the harness demotes the largest rules to pointers "
+        "(`- <path>: <description>`); agentscope cannot compute token "
+        "usage, so the cutoff is not predicted here")
+    res["notes"].append(
+        "[documented] model_decision rules inject only path+description "
+        "upfront (progressive disclosure); manual rules load only on "
+        "explicit @-mention; glob rules activate on file-pattern match — "
+        "all dynamic, reported structurally above")
+    res["notes"].append(
+        "[inferred] the harness walks from the touched file's folder to "
+        "the WORKSPACE root; agentscope walks to the filesystem root, so "
+        "ancestors above the real workspace root may over-report")
+    return res
+
+
+def hooks_from_antigravity_shape(res, obj, source, scope, via):
+    """Parse an Antigravity hooks.json: name -> {enabled?, Event: [...]}."""
+    if not isinstance(obj, dict):
+        res["warnings"].append(
+            "malformed hooks.json in %s (expected an object); skipped" % source)
+        return
+    for hook_name, definition in sorted(obj.items()):
+        if not isinstance(definition, dict):
+            res["warnings"].append(
+                "hook %r in %s is not an object; skipped" % (hook_name, source))
+            continue
+        if definition.get("enabled") is False:
+            res["notes"].append(
+                "hook %r in %s disabled (enabled: false); skipped "
+                "[documented]" % (hook_name, source))
+            continue
+        for event, handlers in definition.items():
+            if event == "enabled":
+                continue
+            if event not in ANTIGRAVITY_HOOK_EVENTS:
+                res["warnings"].append(
+                    "[inferred] %r in %s is not a documented Antigravity "
+                    "hook event; the harness may ignore it"
+                    % (event, source))
+            if not isinstance(handlers, list):
+                res["warnings"].append(
+                    "hook %r event %r in %s is not a list; skipped"
+                    % (hook_name, event, source))
+                continue
+            for hdef in handlers:
+                if not isinstance(hdef, dict):
+                    continue
+                matcher = hdef.get("matcher", "")
+                entries = hdef.get("hooks")
+                if not isinstance(entries, list):
+                    res["warnings"].append(
+                        "hook %r event %r in %s has no hooks list; skipped"
+                        % (hook_name, event, source))
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    etype = entry.get("type", "command")
+                    if etype != "command":
+                        res["warnings"].append(
+                            "hook %r event %r in %s: type %r is not "
+                            "'command' (the only documented type); skipped "
+                            "[documented]" % (hook_name, event, source,
+                                              etype))
+                        continue
+                    cmd = entry.get("command")
+                    if not cmd:
+                        res["warnings"].append(
+                            "hook %r event %r in %s: entry has no command; "
+                            "skipped" % (hook_name, event, source))
+                        continue
+                    add_hook(res, event, matcher, source, scope, cmd, via,
+                             timeout=entry.get("timeout"),
+                             note="hook %r [documented]" % hook_name)
+
+
+def resolve_hooks_antigravity(d):
+    """Antigravity hook resolution.
+
+    Verified 2026-10-23 vs the OFFICIAL hooks reference
+    (antigravity.google/docs/hooks/). Config: `.agents/hooks.json` at the
+    workspace root and `~/.gemini/config/hooks.json` globally
+    [documented]; the workspace file is found by nearest-upward search
+    [inferred]. Six events (SessionStart, PreToolUse, PostToolUse,
+    PreInvocation, PostInvocation, Stop); matcher is a regex over tool
+    names for Pre/PostToolUse ("" or "*" = all) and ignored for the
+    other four [documented]. Hook commands are shown verbatim and NEVER
+    executed (agentscope's strict read-only guarantee).
+    """
+    res = new_hook_resolution("antigravity")
+    h = home()
+    ad = os.path.abspath(d)
+    files = []
+    for level in upward(ad):
+        cand = os.path.join(level, ".agents", "hooks.json")
+        if os.path.isfile(cand):
+            files.append((cand, "workspace (nearest upward)",
+                          "[documented] .agents/hooks.json = workspace "
+                          "scope; [inferred] found by nearest-upward search"))
+            break
+    files.append((os.path.join(h, ".gemini", "config", "hooks.json"),
+                  "global",
+                  "[documented] ~/.gemini/config/hooks.json = global scope"))
+    for path, scope, via in files:
+        obj = read_json_obj(path)
+        if obj is None:
+            if os.path.exists(path):
+                res["warnings"].append(
+                    "%s exists but is unreadable/not JSON" % path)
+            continue
+        hooks_from_antigravity_shape(res, obj, path, scope, via)
+    res["notes"].append(
+        "[documented] hooks.json maps hook NAME -> {enabled?, Event: "
+        "[{matcher, hooks: [{type, command, timeout}]}]}; commands are "
+        "shown verbatim and NEVER executed by agentscope")
+    res["notes"].append(
+        "[documented] matcher is a regex over tool names for PreToolUse/"
+        "PostToolUse (\"\" or \"*\" = all tools); ignored for SessionStart, "
+        "PreInvocation, PostInvocation, Stop")
+    res["notes"].append(
+        "[documented] stdin JSON (camelCase) / stdout JSON contract; "
+        "PreToolUse stdout REQUIRES a `decision` (allow | auto_approve | "
+        "deny | ask | force_ask | deny_unless_prior_grant). Exit-code "
+        "semantics are undocumented — hooktest --harness antigravity "
+        "models the payloads and refuses to interpret non-zero exits")
+    res["notes"].append(
+        "[inferred] merge order across workspace/global scopes is "
+        "undocumented; both scopes are listed above")
+    return res
+
+
+def resolve_mcp_antigravity(d):
+    """Antigravity MCP servers.
+
+    Global config ~/.gemini/config/mcp_config.json (`mcpServers` map)
+    [documented in Google Cloud docs + guides]. Project-level
+    .agents/mcp_config.json (nearest upward) is community-reported
+    (medium.com 2026-10-22: the harness walks up looking for .agents/
+    and loads MCP config from it) — tagged [inferred]. Same structural
+    secret safety as the other MCP resolvers: env/header names only,
+    URL query/fragment stripped, remotes never probed.
+    """
+    res = new_mcp_resolution("antigravity")
+    h = home()
+    gpath = os.path.join(h, ".gemini", "config", "mcp_config.json")
+    gobj = read_json_obj(gpath)
+    if gobj is not None:
+        mcp_from_json_block(res, gobj.get("mcpServers"), gpath, "global",
+                            "[documented] ~/.gemini/config/mcp_config.json")
+    elif os.path.exists(gpath):
+        res["warnings"].append("%s exists but is unreadable/not JSON" % gpath)
+    for level in upward(os.path.abspath(d)):
+        p = os.path.join(level, ".agents", "mcp_config.json")
+        if os.path.isfile(p):
+            pobj = read_json_obj(p)
+            if pobj is not None:
+                mcp_from_json_block(
+                    res, pobj.get("mcpServers"), p, "project (nearest upward)",
+                    "[inferred] .agents/mcp_config.json — community-"
+                    "reported, not in the official docs checked 2026-10-23")
+            else:
+                res["warnings"].append(
+                    "%s exists but is unreadable/not JSON" % p)
+            break
+    res["notes"].append(
+        "[documented] env/header VALUES are never shown (names only); "
+        "remote servers are never probed")
+    res["notes"].append(
+        "[documented] refer to secrets as ${VAR_NAME} in the config; "
+        "agentscope reports the names, never the values")
+    return res
+
+
+def resolve_permissions_antigravity(d):
+    """Antigravity permission rules: UI-managed, nothing static to resolve.
+
+    The official permissions reference (antigravity.google/docs/
+    permissions/, verified 2026-10-23) documents a Deny/Ask/Allow model
+    over action(target) resources (read_file, write_file, read_url,
+    execute_url, command, mcp) layered over presets (Request Review /
+    Default / Auto (Preview) / Turbo) — all managed in Settings >
+    General > Global Permissions / Settings > Projects. No static
+    config-file format is documented, and permission grants are
+    explicitly not repo-shippable, so an empty resolution with honest
+    notes is the correct model (cf. the rejected effective-env
+    resolver: don't print fake precision).
+    """
+    res = new_perm_resolution("antigravity")
+    res["notes"].append(
+        "[documented] permission rules (Deny/Ask/Allow lists of "
+        "action(target) resources + presets) are UI-managed in Settings; "
+        "no static config-file format is documented, so there is nothing "
+        "to resolve from disk — this empty resolution is the honest model")
+    res["notes"].append(
+        "[documented] evaluation: Deny blocks immediately, Ask prompts, "
+        "Allow skips prompting; configured rules layer over the preset "
+        "(Request Review / Default / Auto (Preview) / Turbo) and always "
+        "take precedence")
+    res["notes"].append(
+        "[documented] actions: read_file, write_file (implies read_file), "
+        "read_url, execute_url, command (prefix or regex:), mcp "
+        "(server/tool); write_file implies read_file, deny read implies "
+        "deny write")
+    res["notes"].append(
+        "[documented] PreToolUse hooks CAN enforce permission decisions "
+        "programmatically (decision + permissionOverrides) — see "
+        "agentscope --harness antigravity --hooks and "
+        "hooktest --harness antigravity")
+    return res
+
+
 INSTR_RESOLVERS = {"codex": resolve_codex, "claude": resolve_claude,
                    "cursor": resolve_cursor, "copilot": resolve_copilot,
-                   "gemini": resolve_gemini, "opencode": resolve_opencode}
+                   "gemini": resolve_gemini, "opencode": resolve_opencode,
+                   "antigravity": resolve_antigravity}
 
 
 # --------------------------------------------------------------------------
@@ -1101,7 +1518,8 @@ def resolve_mcp_opencode(d):
 
 MCP_RESOLVERS = {"codex": resolve_mcp_codex, "claude": resolve_mcp_claude,
                  "cursor": resolve_mcp_cursor, "copilot": resolve_mcp_copilot,
-                 "gemini": resolve_mcp_gemini, "opencode": resolve_mcp_opencode}
+                 "gemini": resolve_mcp_gemini, "opencode": resolve_mcp_opencode,
+                 "antigravity": resolve_mcp_antigravity}
 RESOLVERS = {"instructions": INSTR_RESOLVERS, "mcp": MCP_RESOLVERS}
 
 
@@ -1646,7 +2064,8 @@ HOOK_RESOLVERS = {"codex": resolve_hooks_codex, "claude": resolve_hooks_claude,
                   "cursor": resolve_hooks_cursor,
                   "copilot": resolve_hooks_copilot,
                   "gemini": resolve_hooks_gemini,
-                  "opencode": resolve_hooks_opencode}
+                  "opencode": resolve_hooks_opencode,
+                  "antigravity": resolve_hooks_antigravity}
 RESOLVERS["hooks"] = HOOK_RESOLVERS
 
 # --------------------------------------------------------------------------
@@ -1886,7 +2305,8 @@ PERM_RESOLVERS = {"codex": resolve_permissions_codex,
                   "cursor": resolve_permissions_cursor,
                   "copilot": resolve_permissions_copilot,
                   "gemini": resolve_permissions_gemini,
-                  "opencode": resolve_permissions_opencode}
+                  "opencode": resolve_permissions_opencode,
+                  "antigravity": resolve_permissions_antigravity}
 RESOLVERS["permissions"] = PERM_RESOLVERS
 
 

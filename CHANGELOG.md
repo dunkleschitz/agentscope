@@ -1,5 +1,41 @@
 # CHANGELOG — agentscope
 
+## 1.6.0 (2026-10-23)
+
+Seventh harness: `--harness antigravity` (Google's agent IDE/CLI/App),
+all four modes, rules verified 2026-10-23 against the official docs
+(antigravity.google/docs/rules/, /hooks/, /permissions/):
+
+- **instructions**: cumulative (not replacement-based) resolution —
+  directory-scoped rules nearest-first (`AGENTS.md`/`GEMINI.md`,
+  `.agents/AGENTS.md`/`GEMINI.md`, `.agents/rules/*.md` with frontmatter
+  `trigger: always_on|model_decision|glob|manual`, legacy `.agent/`
+  honored), `.agents/rules.json` inherits/entries expansion (relative
+  paths resolved against the `.agents` dir [inferred]), then global
+  `~/.gemini/AGENTS.md`, `~/.gemini/GEMINI.md`,
+  `~/.gemini/config/AGENTS.md`/`GEMINI.md`,
+  `~/.gemini/config/rules/*.md`. 24 KB per-file truncation warning;
+  `@[label](path)` includes listed (inlined by the harness, not expanded
+  here); workspace-root vs filesystem-root over-reporting noted honestly.
+- **--hooks**: `.agents/hooks.json` (workspace, nearest-upward search
+  [inferred]) + `~/.gemini/config/hooks.json` (global) [documented];
+  6 events (SessionStart, PreToolUse, PostToolUse, PreInvocation,
+  PostInvocation, Stop); matcher regexes over tool names (ignored for
+  non-tool events); `enabled: false` honored; commands shown verbatim,
+  never executed (dedicated never-executes test). Pairs with
+  hooktest v1.5.0 `--harness antigravity`.
+- **--mcp**: `~/.gemini/config/mcp_config.json` [documented] plus
+  community-reported `.agents/mcp_config.json` [inferred]; same
+  structural secret safety (env/header names only, URLs masked, remotes
+  never probed).
+- **--permissions**: honestly empty with documented notes — permission
+  rules (Deny/Ask/Allow over `action(target)` resources + presets) are
+  UI-managed (Settings); no static config format exists. PreToolUse
+  hooks as the programmatic enforcement path, cross-linked to hooktest.
+- 107 tests (16 new, incl. rules.json expansion, 24 KB warning,
+  enabled:false skip, never-executes, MCP secret safety, honest-empty
+  permissions, --diff-harness inclusion).
+
 ## 1.5.0 (2026-10-22)
 
 Copilot `--hooks` resolution upgraded against the official GitHub Copilot

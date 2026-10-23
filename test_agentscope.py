@@ -1041,18 +1041,6 @@ class OpencodeTests(Base):
                       os.path.join(root, "sub"))
         self.assertEqual(r.returncode, 1)
 
-    def test_mcp_and_permissions_notes(self):
-        root, home = self.tree({"AGENTS.md": "# root\n"})
-        r = self.tool(home, "--mcp", "--harness", "opencode", "--json", root)
-        m = json.loads(r.stdout)["harnesses"][0]
-        self.assertEqual(m["servers"], [])
-        self.assertTrue(m["notes"])
-        r = self.tool(home, "--permissions", "--harness", "opencode",
-                      "--json", root)
-        p = json.loads(r.stdout)["harnesses"][0]
-        self.assertEqual(p["rules"], [])
-        self.assertTrue(any("last-match-wins" in n for n in p["notes"]))
-
     def test_diff_harness(self):
         root, home = self.tree({"AGENTS.md": "# root\n",
                                 "CLAUDE.md": "# claude-only\n"})
@@ -1063,3 +1051,112 @@ class OpencodeTests(Base):
         self.assertEqual(body["what"], "instruction files")
         # claude merges upward (both files); opencode takes first match
         self.assertIn(os.path.join(root, "CLAUDE.md"), body["only_in_a"])
+
+
+class OpencodeMcpTests(Base):
+    MCP_CFG = {
+        "mcp": {"servers": {
+            "fs": {"type": "local",
+                   "command": ["npx", "-y", "server-fs", "/tmp"],
+                   "environment": {"MY_VAR": "value",
+                                   "KEY": "{env:MY_VAR}"}},
+            "ctx": {"type": "remote",
+                    "url": "https://mcp.example.com/mcp?token=SECRET",
+                    "headers": {"X-Auth": "{env:TOKEN}"}},
+            "old": {"type": "local", "command": ["old-bin"],
+                    "disabled": True},
+        }}}
+
+    def test_local_and_remote_servers(self):
+        root, home = self.tree(
+            {"opencode.json": json.dumps(self.MCP_CFG)})
+        r = self.tool(home, "--mcp", "--harness", "opencode", "--json", root)
+        self.assertEqual(r.returncode, 0)
+        ss = {s["name"]: s
+              for s in json.loads(r.stdout)["harnesses"][0]["servers"]}
+        self.assertEqual(ss["fs"]["transport"], "stdio")
+        self.assertEqual(ss["fs"]["command"], "npx")
+        self.assertEqual(ss["fs"]["args"], ["-y", "server-fs", "/tmp"])
+        self.assertEqual(ss["ctx"]["transport"], "http")
+        self.assertIn("never probed", ss["ctx"]["note"])
+
+    def test_secret_safety_structural(self):
+        root, home = self.tree(
+            {"opencode.json": json.dumps(self.MCP_CFG)})
+        r = self.tool(home, "--mcp", "--harness", "opencode", root)
+        self.assertNotIn("token=SECRET", r.stdout)      # query stripped
+        self.assertNotIn('"MY_VAR": "value"', r.stdout)  # values not shown
+        self.assertIn("MY_VAR", r.stdout)               # names shown
+        self.assertIn("X-Auth", r.stdout)
+
+    def test_disabled_flag(self):
+        root, home = self.tree(
+            {"opencode.json": json.dumps(self.MCP_CFG)})
+        r = self.tool(home, "--mcp", "--harness", "opencode", "--json", root)
+        ss = {s["name"]: s
+              for s in json.loads(r.stdout)["harnesses"][0]["servers"]}
+        self.assertIn("disabled", ss["old"]["note"])
+
+    def test_project_replaces_global(self):
+        root, home = self.tree(
+            {"opencode.json": json.dumps(
+                {"mcp": {"servers": {
+                    "dup": {"type": "remote",
+                            "url": "https://proj.example.com/mcp"}}}})})
+        gcfg = os.path.join(home, ".config", "opencode", "opencode.json")
+        os.makedirs(os.path.dirname(gcfg))
+        with open(gcfg, "w") as f:
+            json.dump({"mcp": {"servers": {
+                "dup": {"type": "local", "command": ["glob-bin"]}}}}, f)
+        r = self.tool(home, "--mcp", "--harness", "opencode", "--json", root)
+        body = json.loads(r.stdout)["harnesses"][0]
+        self.assertTrue(any("replaces the entire" in n for n in body["notes"]))
+
+    def test_legacy_shape_warning(self):
+        root, home = self.tree(
+            {"opencode.json": json.dumps(
+                {"mcp": {"fs": {"type": "local",
+                                "command": ["old-bin"]}}})})
+        r = self.tool(home, "--mcp", "--harness", "opencode", "--json", root)
+        body = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(body["servers"], [])
+        self.assertTrue(any("pre-v2" in w for w in body["warnings"]))
+
+    def test_unknown_type_warning(self):
+        root, home = self.tree(
+            {"opencode.json": json.dumps(
+                {"mcp": {"servers": {"weird": {"foo": 1}}}})})
+        r = self.tool(home, "--mcp", "--harness", "opencode", "--json", root)
+        body = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(body["servers"], [])
+        self.assertTrue(any("unknown/absent `type`" in w
+                            for w in body["warnings"]))
+
+
+class OpencodePermissionsTests(Base):
+    def test_permissions_array(self):
+        root, home = self.tree(
+            {"opencode.json": json.dumps({"permissions": [
+                {"action": "ctx_*", "resource": "*", "effect": "deny"},
+                {"action": "opencode_read_mcp_resource",
+                 "resource": "docs:*", "effect": "allow"}]})})
+        r = self.tool(home, "--permissions", "--harness", "opencode",
+                      "--json", root)
+        self.assertEqual(r.returncode, 0)
+        rules = json.loads(r.stdout)["harnesses"][0]["rules"]
+        self.assertEqual(len(rules), 2)
+        self.assertIn("action=ctx_* resource=* effect=deny",
+                      [x["rule"] for x in rules])
+        self.assertTrue(all("opencode.ai/v2/docs/mcp-servers" in x["via"]
+                            for x in rules))
+        self.assertTrue(any("no merge order assumed" in x["note"]
+                            for x in rules))
+
+    def test_no_permissions_note(self):
+        root, home = self.tree({"opencode.json": json.dumps({"mcp": {}})})
+        r = self.tool(home, "--permissions", "--harness", "opencode",
+                      "--json", root)
+        body = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(body["rules"], [])
+        self.assertTrue(any("no `permissions` array" in n
+                            for n in body["notes"]))

@@ -998,12 +998,104 @@ def resolve_mcp_gemini(d):
     return res
 
 
+def _opencode_configs(d):
+    """(path, scope) for the project opencode.json (nearest upward search)
+    and the global one. Scopes [documented]; the upward project-config
+    search is [inferred]."""
+    out = []
+    for level in upward(d):
+        cand = os.path.join(level, "opencode.json")
+        if os.path.isfile(cand):
+            out.append((cand, "project"))
+            break
+    gp = os.path.join(home(), ".config", "opencode", "opencode.json")
+    if os.path.isfile(gp):
+        out.append((gp, "global"))
+    return out
+
+
 def resolve_mcp_opencode(d):
+    """OpenCode MCP servers from opencode.json (v2 layout: `mcp.servers`).
+
+    Verified 2026-10-22 against opencode.ai/v2/docs/mcp-servers: local
+    servers (command/cwd/environment/disabled), remote servers (url,
+    headers, oauth, disabled), project config REPLACES the entire server
+    object with the same name from the global config [all documented].
+    Secret safety is structural: env/header VALUES are never printed
+    (names + <set>), URL query/fragment is stripped, remote servers are
+    never probed. Strictly read-only.
+    """
     res = new_mcp_resolution("opencode")
-    res["notes"].append(
-        "[inferred] OpenCode MCP config lives in opencode.json (`mcp`); the "
-        "layout was not verified against vendor docs on 2026-10-22, so it is "
-        "not modeled — inspect opencode.json directly")
+    origins = {}  # name -> (scope, source) for override notes
+    for cfg_path, scope in _opencode_configs(d):
+        cfg = read_json_obj(cfg_path)
+        if not cfg:
+            continue
+        mcp = cfg.get("mcp")
+        if not isinstance(mcp, dict):
+            continue
+        servers = mcp.get("servers")
+        if servers is None:
+            legacy = {k: v for k, v in mcp.items()
+                      if isinstance(v, dict)
+                      and ("type" in v or "command" in v or "url" in v)}
+            if legacy:
+                res["warnings"].append(
+                    "[documented] pre-v2 `mcp.<name>` layout (server names "
+                    "directly under `mcp`) found in %s — v2 groups servers "
+                    "under `mcp.servers`; legacy entries not modeled: %s"
+                    % (cfg_path, ", ".join(sorted(legacy))))
+            continue
+        if not isinstance(servers, dict):
+            res["warnings"].append(
+                "`mcp.servers` is not an object in %s; skipped" % cfg_path)
+            continue
+        for name, entry in servers.items():
+            if not isinstance(entry, dict):
+                res["warnings"].append(
+                    "server %r is not an object in %s; skipped"
+                    % (name, cfg_path))
+                continue
+            stype = entry.get("type")
+            transport = {"local": "stdio", "remote": "http"}.get(stype,
+                                                               "unknown")
+            dis = entry.get("disabled") is True
+            dnote = ("[documented] disabled: true — configured but not "
+                     "connected") if dis else ""
+            if stype == "local":
+                cmd = entry.get("command") or []
+                cmd = [str(c) for c in cmd] if isinstance(cmd, list) else []
+                add_mcp_server(res, name, cfg_path, scope, transport,
+                               "[documented] opencode.json `mcp.servers` "
+                               "(v2 layout)",
+                               command=cmd[0] if cmd else "",
+                               args=cmd[1:] if len(cmd) > 1 else [],
+                               env=entry.get("environment"), note=dnote)
+            elif stype == "remote":
+                add_mcp_server(
+                    res, name, cfg_path, scope, transport,
+                    "[documented] opencode.json `mcp.servers` (v2 layout)",
+                    url=entry.get("url") or "",
+                    headers=entry.get("headers"),
+                    note=((dnote + "; ") if dnote else "") +
+                         "[documented] OAuth enabled by default unless "
+                         "`oauth: false`; remote servers are listed as "
+                         "REMOTE and never probed")
+            else:
+                res["warnings"].append(
+                    "server %r: unknown/absent `type` %r in %s; skipped"
+                    % (name, stype, cfg_path))
+                continue
+            if name in origins and origins[name] != (scope, cfg_path):
+                res["notes"].append(
+                    "[documented] server %r defined in %s and %s: the "
+                    "higher-precedence project config replaces the entire "
+                    "server object" % (name, origins[name][1], cfg_path))
+            origins[name] = (scope, cfg_path)
+    if not _opencode_configs(d):
+        res["notes"].append(
+            "[inferred] no opencode.json found (project or global); "
+            "nothing to resolve")
     return res
 
 
@@ -1651,11 +1743,50 @@ def resolve_permissions_copilot(d):
 
 
 def resolve_permissions_opencode(d):
+    """OpenCode permission rules from the top-level `permissions` array in
+    opencode.json: [{action, resource, effect}].
+
+    Verified 2026-10-22 against opencode.ai/v2/docs/mcp-servers: `action`
+    matches the normalized `<server>_<tool>` name (or built-in actions
+    like opencode_read_mcp_resource); `resource` is a pattern; `effect` is
+    allow/deny in the documented examples. Rule evaluation ORDER across
+    the array is not documented, so no merge order is assumed
+    [inferred]. Rules shown verbatim; strictly read-only.
+    """
     res = new_perm_resolution("opencode")
-    res["notes"].append(
-        "[documented] OpenCode has a permission system (glob -> allow/ask/"
-        "deny, last-match-wins per community guides), but it is not modeled "
-        "in this version; instructions resolution only")
+    cfgs = _opencode_configs(d)
+    for cfg_path, scope in cfgs:
+        cfg = read_json_obj(cfg_path)
+        if not cfg:
+            continue
+        perms = cfg.get("permissions")
+        if perms is None:
+            continue
+        if not isinstance(perms, list):
+            res["warnings"].append(
+                "`permissions` is not a list in %s; skipped" % cfg_path)
+            continue
+        for p in perms:
+            if not isinstance(p, dict):
+                res["warnings"].append(
+                    "non-object `permissions` entry in %s; skipped"
+                    % cfg_path)
+                continue
+            rule = ("action=%s resource=%s effect=%s"
+                    % (p.get("action", ""), p.get("resource", ""),
+                       p.get("effect", "")))
+            add_perm_rule(
+                res, "opencode", rule, cfg_path, scope,
+                "[documented] opencode.json `permissions` array "
+                "(opencode.ai/v2/docs/mcp-servers)",
+                note="[documented] fields action/resource/effect; "
+                     "[inferred] evaluation order across the array is "
+                     "undocumented — no merge order assumed; rules are "
+                     "shown verbatim")
+    if not res["rules"]:
+        res["notes"].append(
+            "[inferred] no `permissions` array found in %s"
+            % (", ".join(p for p, _ in cfgs) or "any opencode.json"))
     return res
 
 

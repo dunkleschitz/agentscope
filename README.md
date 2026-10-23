@@ -171,7 +171,7 @@ context setting resolves; **1** = none resolve; **2** = usage error.
 | `cursor` | `.cursor/rules/*.{mdc,md}` with frontmatter scope (`globs`/`alwaysApply`) matched against the directory (heuristic); legacy `.cursorrules`; nested `AGENTS.md` combined with parents |
 | `copilot` | nearest `.github/copilot-instructions.md`; `.github/instructions/*.instructions.md` with `applyTo` matching (heuristic); nearest `AGENTS.md` wins; root `CLAUDE.md`/`GEMINI.md` alternatives |
 | `gemini` | `context.fileName` from `.gemini/settings.json` else `~/.gemini/settings.json` (default `GEMINI.md`); global `~/.gemini/GEMINI.md`; upward walk concatenated general→specific; `@file` imports inlined |
-| `opencode` | **first-match-wins per directory** (AGENTS.md shadows CLAUDE.md — not concatenated like the others); global `~/.config/opencode/AGENTS.md`; `~/.claude/CLAUDE.md` compat fallback (disabled by `OPENCODE_DISABLE_CLAUDE_CODE*`); `opencode.json` `instructions` entries (paths, globs, remote URLs — remotes listed, never fetched); **no** `@file` import expansion (the harness doesn't parse them) |
+| `opencode` | **first-match-wins per directory** (AGENTS.md shadows CLAUDE.md — not concatenated like the others); global `~/.config/opencode/AGENTS.md`; `~/.claude/CLAUDE.md` compat fallback (disabled by `OPENCODE_DISABLE_CLAUDE_CODE*`); `opencode.json` `instructions` entries (paths, globs, remote URLs — remotes listed, never fetched); **no** `@file` import expansion (the harness doesn't parse them). `--mcp` reads the v2 `mcp.servers` layout; `--permissions` reads the `permissions` array |
 
 ## The honesty model
 
@@ -217,7 +217,7 @@ session hinges on it, confirm against the harness's own docs.
 ## Testing
 
 ```bash
-python3 -m unittest test_agentscope -v   # 84 tests
+python3 -m unittest test_agentscope -v   # 91 tests
 ```
 
 Stdlib only (Python 3.11+, for `tomllib`). No dependencies. Strictly

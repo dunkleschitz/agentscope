@@ -17,10 +17,18 @@ used (the upward search is [inferred]); no `@file` import expansion
 (the harness does not parse file references — [documented]). The
 read-time "nearer instruction file attached as a system reminder"
 behavior is dynamic per-read and reported as a note, never claimed as
-static output. --mcp/--hooks/--permissions for opencode resolve empty
-with honest notes (OpenCode's permission system — glob → allow/ask/deny,
-last-match-wins — is documented but not yet modeled). 84 tests (11 new
-opencode + a rewritten gemini-hooks test).
+static output. `--mcp` covers opencode too (v2 `mcp.servers` layout
+verified 2026-10-22 vs opencode.ai/v2/docs/mcp-servers: local/remote
+types, command/cwd/environment/disabled, headers, OAuth-on-by-default
+note, project-config-replaces-global override semantics [all
+documented]; pre-v2 `mcp.<name>` layout warned as unmodeled; env/header
+values never printed, URLs masked, remote servers never probed). And
+`--permissions` models opencode's documented `permissions` array
+(action/resource/effect — evaluation order across the array is
+undocumented, so no merge order is assumed, rules verbatim). `--hooks`
+for opencode resolves empty with a note. 91 tests (17 opencode: 9
+instructions + 6 mcp + 2 permissions, plus the rewritten gemini-hooks
+test).
 
 Also fixed in this release: the `--hooks` note for Gemini CLI claimed
 (no evidence) that no hook mechanism existed; the official Gemini CLI

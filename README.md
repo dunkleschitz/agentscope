@@ -1,8 +1,10 @@
-# agentscope — effective-instruction, effective-MCP, effective-hook, and effective-permissions resolver
+# agentscope — effective-instruction, effective-MCP, effective-hook, effective-permissions, and discoverable-skills resolver
 
 "What instructions does harness X actually load for directory Y?" —
 and, since v1.1.0, "which **MCP servers** does it actually load?" —
-and, since v1.2.0, "which **hooks** does it actually fire?"
+since v1.2.0, "which **hooks** does it actually fire?" — since v1.3.0,
+"which **permission rules** does it enforce?" — and, since v1.7.0,
+"which **skills** can it actually see?"
 
 Every coding-agent harness discovers instruction files with different
 semantics. Codex concatenates root-to-cwd with a silent 32 KiB cap. Claude
@@ -162,6 +164,65 @@ Per-harness permission sources (verified via web search, 2026-10-22):
 Exit codes in `--permissions` mode: **0** = at least one rule or
 context setting resolves; **1** = none resolve; **2** = usage error.
 
+## `--skills`: discoverable Agent Skills per harness (v1.7.0)
+
+"Which skills will harness X actually *see* for directory Y?" — the
+same effective-resolution question, for Agent Skills (the
+agentskills.io `SKILL.md` standard). Installers (`npx skills`, APM,
+plugin marketplaces) answer "where do I put a skill"; prose guides
+answer "what does harness X load" only as folder lists. When a harness
+doesn't offer an installed skill, the cause is usually a wrong folder
+or invalid frontmatter — both diagnosed here deterministically.
+
+```bash
+agentscope --skills                          # all harnesses, current dir
+agentscope --skills --harness codex .
+agentscope --skills --outline                # id/verdict/scope only
+agentscope --skills --json
+agentscope --skills --diff-harness claude codex .
+```
+
+Reports, per harness: every `<name>/SKILL.md` found in that harness's
+documented skill locations (personal + project, with per-harness extras
+like Claude plugin skills and Cursor's compatibility dirs), each with a
+verdict — **VALID**, **INVALID** (name/folder mismatch, bad frontmatter,
+missing description — reported, never silently skipped), or
+**DUPLICATE-NAME** (same skill id from multiple scopes, with the
+per-harness precedence winner named) — plus scope, source path, and the
+documented-rule tag (`[documented]`/`[inferred]`).
+
+**Discovery, not loading:** harnesses load skill bodies on-demand by
+description match (progressive disclosure — name+description listed at
+startup, full `SKILL.md` read on match). agentscope resolves the
+*discoverable* set per directory; it says nothing about which skills the
+harness will actually use. This is the narrower claim an earlier review
+of this angle demanded ("an 'effective set' would overstate loading
+semantics").
+
+**Read-only by construction:** only `SKILL.md` frontmatter is parsed;
+a skill's `scripts/` and `references/` folders are never descended
+into, nothing is ever executed, and remote skill catalogs (e.g.
+OpenCode's configured `skills.urls`) are listed but **never fetched**.
+(There is a test that plants a marker-dropping shell script inside a
+skill and asserts the marker is never created, and a test asserting the
+tool has no network imports.)
+
+Per-harness skill locations (verified 2026-10-23; see
+`toolsmith/scratch/agentscope-skills-verification.md`):
+
+| Harness | Locations |
+|---|---|
+| `claude` | `~/.claude/skills/` (personal), `./.claude/skills/` (project, nested upward); `<plugin>/skills/` (namespaced `plugin:skill`); collision precedence enterprise > personal > project |
+| `codex` | `./.agents/skills/` in every folder from cwd up to the repo root, `~/.agents/skills/` (personal); ~2% of context window cap warned |
+| `cursor` | `.agents/skills/`, `.cursor/skills/`, compat `.claude/skills/`, `.codex/skills/` (project); `~/.agents/skills/`, `~/.cursor/skills/` (personal) |
+| `copilot` | `.github/skills/`, `.claude/skills/`, `.agents/skills/` (project); `~/.copilot/skills/`, `~/.agents/skills/` (personal; `~/.claude/skills/` under VS Code) |
+| `gemini` | `.gemini/skills/`, `.agents/skills/` (project); `~/.gemini/skills/`, `~/.agents/skills/` (personal); interactive `activate_skill` gating noted |
+| `opencode` | six locations — `.opencode/skills/`, `.claude/skills/`, `.agents/skills/` × project (walks up to the git worktree) + global; v1: ID = frontmatter `name`; v2: ID derived from path (auto-detected from the config layout); `skills.urls` remotes listed, never fetched |
+| `antigravity` | `<workspace>/.agents/skills/` (+ legacy `.agent/skills/`); global path **conflicted** in the evidence (`~/.gemini/config/skills/` recent vs `~/.gemini/antigravity/skills/` older) — both modeled, with an explicit "verify against the docs" note |
+
+Exit codes in `--skills` mode: **0** = at least one skill found;
+**1** = none; **2** = usage error.
+
 ## Supported harnesses
 
 | Harness | What agentscope resolves |
@@ -179,7 +240,7 @@ context setting resolves; **1** = none resolve; **2** = usage error.
 **agentscope is a model of documented harness behavior, not runtime
 truth.** Every rule applied is tagged `[documented]` or `[inferred]`, and
 the banner carries the date the rules were last verified against public
-docs (2026-10-22). Harness behavior drifts with releases; when a debug
+docs (2026-10-23). Harness behavior drifts with releases; when a debug
 session hinges on it, confirm against the harness's own docs.
 
 - Truncation is reported as total-bytes vs cap with an **estimated**
@@ -197,6 +258,10 @@ session hinges on it, confirm against the harness's own docs.
   cannot be determined from the filesystem; flagged as a note.
 - `@`-import recursion caps and filename fallbacks follow documented
   values where they exist, best-effort defaults where they don't.
+- `--skills` reports the **discoverable** set, not the loaded set: skill
+  bodies load on-demand by description match, so visible ≠ will-be-used
+  (an earlier review rejected an "effective set" claim for exactly this
+  reason; the narrower discovery claim is what's built).
 - Symlink loops in the directory walk are not followed (`os.walk`
   default); unreadable files are skipped silently per contributor,
   warned per import.

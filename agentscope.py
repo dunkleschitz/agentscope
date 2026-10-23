@@ -21,6 +21,8 @@ loaded set per harness for a directory, from the files on disk.
     agentscope --hooks                          # effective hook sets
     agentscope --hooks --harness claude .
     agentscope --permissions                    # effective allow/deny rule sets
+    agentscope --skills                         # discoverable skills per harness
+    agentscope --skills --harness opencode .
 
 Exit codes: 0 = at least one contributing item resolved; 1 = nothing resolved
 for the selected harness(es) (the harness would enforce nothing); 2 = usage
@@ -52,8 +54,8 @@ import os
 import re
 import sys
 
-VERSION = "1.6.0"
-RULES_VERIFIED = "2026-10-22"  # date harness rules were last checked vs docs
+VERSION = "1.7.0"
+RULES_VERIFIED = "2026-10-23"  # date harness rules were last checked vs docs
 
 DOC = "documented"
 INF = "inferred"
@@ -2310,6 +2312,443 @@ PERM_RESOLVERS = {"codex": resolve_permissions_codex,
 RESOLVERS["permissions"] = PERM_RESOLVERS
 
 
+# --------------------------------------------------------------------------
+# skills mode (--skills, v1.7.0)
+# --------------------------------------------------------------------------
+# "Which skills will harness X actually SEE for directory Y?"
+#
+# Discovery is on-disk resolution only: which <name>/SKILL.md folders exist
+# in each harness's documented skill locations for the target directory.
+# Loading is NOT modeled: harnesses load skill bodies on-demand by
+# description match (progressive disclosure — name+description listed at
+# startup, full SKILL.md read on match), so "visible" != "will be used".
+# The Oct 22 rejection of this angle ("an 'effective set' would overstate
+# loading semantics") is kept visible in the README Limitations note and
+# in every text report. Per-harness locations verified 2026-10-23
+# (toolsmith/scratch/agentscope-skills-verification.md).
+#
+# SAFETY IS STRUCTURAL: agentscope NEVER descends into a skill's scripts/
+# or references/ folders, never executes anything, and never touches the
+# network (opencode's configured skills.urls remote catalogs are listed
+# but never fetched). It reads SKILL.md frontmatter only.
+
+SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def new_skill_resolution(harness):
+    return {"harness": harness, "skills": [], "warnings": [], "notes": []}
+
+
+def add_skill(res, skill_id, folder, name, description, path, scope, via,
+              tag=DOC, verdict="VALID", verdict_note=""):
+    res["skills"].append({
+        "id": skill_id, "folder": folder, "name": name or "",
+        "description": (description or "")[:300],
+        "path": path, "scope": scope, "via": via, "tag": tag,
+        "verdict": verdict, "verdict_note": verdict_note or ""})
+
+
+def parse_skill_frontmatter(path):
+    """Heuristic parse of a SKILL.md frontmatter block.
+
+    Returns (fields, error). fields maps top-level keys to scalar values;
+    description continuation lines (indented) are folded with spaces. Full
+    YAML is out of scope: anything ambiguous yields an error, never a
+    guessed value.
+    """
+    data = read_bytes(path)
+    if data is None:
+        return {}, "unreadable"
+    try:
+        text = data.decode("utf-8")
+    except Exception:
+        return {}, "not decodable as UTF-8"
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, "missing frontmatter (first line is not ---)"
+    end = None
+    for i, ln in enumerate(lines[1:], start=1):
+        if ln.strip() in ("---", "..."):
+            end = i
+            break
+    if end is None:
+        return {}, "unterminated frontmatter"
+    fields = {}
+    cur_key = None
+    for ln in lines[1:end]:
+        if re.match(r"^\s", ln) and cur_key == "description":
+            val = ln.strip()
+            if val:
+                fields[cur_key] = (fields.get(cur_key, "") + " " + val).strip()
+            continue
+        m = re.match(r"^([A-Za-z0-9_./-]+)\s*:\s*(.*)$", ln)
+        if m:
+            cur_key = m.group(1)
+            fields[cur_key] = m.group(2).strip().strip("\"'")
+        else:
+            cur_key = None
+    return fields, None
+
+
+def validate_skill_fields(name, desc, folder):
+    """Spec-constraint checks (agentskills.io). Returns a list of errors."""
+    errors = []
+    if not name:
+        errors.append("missing required frontmatter field 'name'")
+    else:
+        if len(name) > 64:
+            errors.append("name %r exceeds 64 chars" % name)
+        if not SKILL_NAME_RE.match(name):
+            errors.append(
+                "name %r violates spec charset "
+                "(lowercase letters/digits/hyphens, no leading/trailing/doubled "
+                "hyphens)" % name)
+        if name != folder:
+            errors.append("name %r does not match folder name %r" % (name, folder))
+    if not desc:
+        errors.append("missing/empty required frontmatter field 'description'")
+    elif len(desc) > 1024:
+        errors.append("description exceeds 1024 chars")
+    return errors
+
+
+def _skill_dirs(basedir):
+    """(folder, SKILL.md path) for every immediate subdir containing one."""
+    found = []
+    if not basedir or not os.path.isdir(basedir):
+        return found
+    try:
+        entries = sorted(os.listdir(basedir))
+    except OSError:
+        return found
+    for e in entries:
+        p = os.path.join(basedir, e)
+        if os.path.isdir(p) and os.path.isfile(os.path.join(p, "SKILL.md")):
+            found.append((e, os.path.join(p, "SKILL.md")))
+    return found
+
+
+def _add_skills_from(res, basedir, scope, via, tag=DOC, id_from_path=False,
+                     namespace=None):
+    for folder, spath in _skill_dirs(basedir):
+        fields, err = parse_skill_frontmatter(spath)
+        if err:
+            add_skill(res, folder, folder, "", "", spath, scope,
+                      "%s [frontmatter: %s]" % (via, err), tag, "INVALID",
+                      "frontmatter unreadable: %s" % err)
+            continue
+        name = fields.get("name", "")
+        desc = fields.get("description", "")
+        errors = validate_skill_fields(name, desc, folder)
+        skill_id = folder if id_from_path else (name or folder)
+        if namespace:
+            skill_id = "%s:%s" % (namespace, skill_id)
+        vnote = "; ".join(errors)
+        if not errors:
+            extras = sorted(k for k in fields
+                            if k not in ("name", "description"))
+            if extras:
+                vnote = ("extra frontmatter fields present (%s) — "
+                         "harness-specific, listed not judged"
+                         % ", ".join(extras))
+            if "disable-model-invocation" in fields:
+                vnote = (vnote + "; " if vnote else "") + \
+                    "present but harness-gated (disable-model-invocation)"
+        add_skill(res, skill_id, folder, name, desc, spath, scope, via, tag,
+                  "VALID" if not errors else "INVALID", vnote)
+
+
+def _skills_dedup(res, precedence, prec_tag=INF):
+    """Same-id claims from multiple scopes -> DUPLICATE-NAME for the losers.
+    precedence lists scopes highest-priority first."""
+    def rank(sk):
+        try:
+            return precedence.index(sk["scope"])
+        except ValueError:
+            return len(precedence)
+    seen = {}
+    for s in res["skills"]:
+        key = s["id"]
+        if key not in seen:
+            seen[key] = s
+            continue
+        cur, new = seen[key], s
+        if rank(new) < rank(cur):
+            winner, loser = new, cur
+            seen[key] = new
+        else:
+            winner, loser = cur, new
+        loser["verdict"] = "DUPLICATE-NAME"
+        loser["verdict_note"] = (
+            "same-name skill also present at %s; %s scope wins "
+            "[%s: precedence %s]"
+            % (winner["path"], winner["scope"], prec_tag,
+               ">".join(precedence)))
+
+
+SKILLS_LOADING_NOTE = (
+    "[documented] loading model: harnesses LIST name+description at session "
+    "start and load the SKILL.md body on description match (progressive "
+    "disclosure). This report is the DISCOVERABLE set per directory — "
+    "visible, not 'will be used'.")
+
+
+def resolve_skills_claude(d):
+    res = new_skill_resolution("claude")
+    root = git_root(d) or d
+    _add_skills_from(res, os.path.join(home(), ".claude", "skills"), "personal",
+                     "[documented] personal skills load in every project")
+    for anc in upward(d):
+        _add_skills_from(res, os.path.join(anc, ".claude", "skills"), "project",
+                         "[documented] nested project skills load when working "
+                         "in that package")
+        if anc == root:
+            break
+    plugbase = os.path.join(home(), ".claude", "plugins")
+    if os.path.isdir(plugbase):
+        try:
+            plugins = sorted(os.listdir(plugbase))
+        except OSError:
+            plugins = []
+        for p in plugins:
+            _add_skills_from(res, os.path.join(plugbase, p, "skills"), "plugin",
+                             "[documented] plugin-bundled skills",
+                             namespace=p)
+    res["notes"].append(
+        "[documented-via-guides] collision precedence: enterprise > personal "
+        "> project; enterprise-managed directory is not enumerable "
+        "statically")
+    res["notes"].append(SKILLS_LOADING_NOTE)
+    _skills_dedup(res, ["enterprise", "personal", "project", "plugin"], DOC)
+    return res
+
+
+def resolve_skills_codex(d):
+    res = new_skill_resolution("codex")
+    root = git_root(d) or d
+    for anc in upward(d):
+        _add_skills_from(res, os.path.join(anc, ".agents", "skills"), "project",
+                         "[documented] .agents/skills in every folder from "
+                         "the working directory up to the repository root")
+        if anc == root:
+            break
+    _add_skills_from(res, os.path.join(home(), ".agents", "skills"), "personal",
+                     "[documented] personal skills")
+    if res["skills"]:
+        res["notes"].append(
+            "[documented] the skill list is limited to ~2% of the context "
+            "window — a large discovered set may be truncated at runtime")
+    res["notes"].append(SKILLS_LOADING_NOTE)
+    _skills_dedup(res, ["personal", "project"])  # [inferred]
+    return res
+
+
+def resolve_skills_cursor(d):
+    res = new_skill_resolution("cursor")
+    root = git_root(d) or d
+    proj_dirs = ((".agents/skills", "[documented]"),
+                 (".cursor/skills", "[documented]"),
+                 (".claude/skills", "[documented] compatibility dir"),
+                 (".codex/skills", "[documented] compatibility dir"))
+    for anc in upward(d):
+        for rel, tag in proj_dirs:
+            _add_skills_from(res, os.path.join(anc, rel), "project",
+                             "%s project skill dir" % tag)
+        if anc == root:
+            break
+    _add_skills_from(res, os.path.join(home(), ".agents", "skills"), "personal",
+                     "[documented] personal skill dir")
+    _add_skills_from(res, os.path.join(home(), ".cursor", "skills"), "personal",
+                     "[documented] personal skill dir")
+    res["notes"].append(SKILLS_LOADING_NOTE)
+    _skills_dedup(res, ["personal", "project"])  # [inferred]
+    return res
+
+
+def resolve_skills_copilot(d):
+    res = new_skill_resolution("copilot")
+    root = git_root(d) or d
+    for anc in upward(d):
+        for rel, tag in ((".github/skills", "[documented]"),
+                         (".claude/skills", "[documented]"),
+                         (".agents/skills", "[documented]")):
+            _add_skills_from(res, os.path.join(anc, rel), "project",
+                             "%s project skill dir" % tag)
+        if anc == root:
+            break
+    _add_skills_from(res, os.path.join(home(), ".copilot", "skills"), "personal",
+                     "[documented] personal skill dir")
+    _add_skills_from(res, os.path.join(home(), ".agents", "skills"), "personal",
+                     "[documented] personal skill dir")
+    res["notes"].append(
+        "[documented] in VS Code, ~/.claude/skills is also read as personal")
+    res["notes"].append(SKILLS_LOADING_NOTE)
+    _skills_dedup(res, ["personal", "project"])  # [inferred]
+    return res
+
+
+def resolve_skills_gemini(d):
+    res = new_skill_resolution("gemini")
+    root = git_root(d) or d
+    for anc in upward(d):
+        for rel in (".gemini/skills", ".agents/skills"):
+            _add_skills_from(res, os.path.join(anc, rel), "project",
+                             "[documented] project skill dir")
+        if anc == root:
+            break
+    _add_skills_from(res, os.path.join(home(), ".gemini", "skills"), "personal",
+                     "[documented] personal skill dir")
+    _add_skills_from(res, os.path.join(home(), ".agents", "skills"), "personal",
+                     "[documented] personal skill dir")
+    res["notes"].append(
+        "[documented] loading is INTERACTIVE: the model calls activate_skill "
+        "and the user confirms the skill name + folder before the body loads "
+        "— presence here does not imply the body is ever read")
+    _skills_dedup(res, ["personal", "project"])  # [inferred]
+    return res
+
+
+def _opencode_is_v2(d):
+    """v2 config signal: mcp.servers layout [documented, v1.4.0 note]."""
+    for cfg, _scope in _opencode_configs(d):
+        obj = read_json_obj(cfg)
+        if isinstance(obj, dict) and isinstance(obj.get("mcp"), dict) \
+                and "servers" in obj["mcp"]:
+            return True
+    return False
+
+
+def resolve_skills_opencode(d):
+    res = new_skill_resolution("opencode")
+    root = git_root(d) or d
+    v2 = _opencode_is_v2(d)
+    pairs = ((".opencode/skills", os.path.join(home(), ".config", "opencode", "skills")),
+             (".claude/skills", os.path.join(home(), ".claude", "skills")),
+             (".agents/skills", os.path.join(home(), ".agents", "skills")))
+    for anc in upward(d):
+        for proj_rel, _ in pairs:
+            _add_skills_from(res, os.path.join(anc, proj_rel), "project",
+                             "[documented] project skill dir (walks up to the "
+                             "git worktree)", id_from_path=v2)
+        if anc == root:
+            break
+    for _, glob_dir in pairs:
+        _add_skills_from(res, glob_dir, "global",
+                         "[documented] global skill dir", id_from_path=v2)
+    if v2:
+        res["notes"].append(
+            "[documented] opencode v2 config detected: skill IDs derive from "
+            "the PATH, not frontmatter name; v2 publishes its own source "
+            "precedence — verify the order against the docs")
+    else:
+        res["notes"].append(
+            "[documented] opencode v1 semantics: skill ID = frontmatter name; "
+            "v2 derives IDs from the path — re-verify if you run v2")
+    for cfg, _scope in _opencode_configs(d):
+        obj = read_json_obj(cfg)
+        urls = obj.get("skills", {}).get("urls") \
+            if isinstance(obj.get("skills"), dict) else None
+        if urls:
+            res["notes"].append(
+                "[documented] configured remote skill catalog(s) in %s: "
+                "LISTED ONLY — agentscope never fetches them" % cfg)
+    res["notes"].append(SKILLS_LOADING_NOTE)
+    _skills_dedup(res, ["global", "project"])  # [inferred]
+    return res
+
+
+def resolve_skills_antigravity(d):
+    res = new_skill_resolution("antigravity")
+    root = git_root(d) or d  # workspace root [inferred]
+    _add_skills_from(res, os.path.join(root, ".agents", "skills"), "workspace",
+                     "[documented] workspace skill dir")
+    _add_skills_from(res, os.path.join(root, ".agent", "skills"), "workspace",
+                     "[documented] legacy workspace skill dir (backward compat)")
+    _add_skills_from(res, os.path.join(home(), ".gemini", "config", "skills"),
+                     "global",
+                     "[documented] global candidate (most recent source, "
+                     "citing official docs)")
+    _add_skills_from(res, os.path.join(home(), ".gemini", "antigravity", "skills"),
+                     "global",
+                     "[inferred] global candidate (older sources)")
+    res["notes"].append(
+        "global skill path UNRESOLVED: ~/.gemini/config/skills (recent, cites "
+        "official docs) vs ~/.gemini/antigravity/skills (older) — verify "
+        "against the docs; BOTH are modeled above")
+    res["notes"].append(
+        "[documented] same-name collision: workspace version takes "
+        "precedence over global")
+    res["notes"].append(SKILLS_LOADING_NOTE)
+    _skills_dedup(res, ["workspace", "global"], DOC)
+    return res
+
+
+SKILLS_RESOLVERS = {"codex": resolve_skills_codex,
+                    "claude": resolve_skills_claude,
+                    "cursor": resolve_skills_cursor,
+                    "copilot": resolve_skills_copilot,
+                    "gemini": resolve_skills_gemini,
+                    "opencode": resolve_skills_opencode,
+                    "antigravity": resolve_skills_antigravity}
+RESOLVERS["skills"] = SKILLS_RESOLVERS
+
+
+def skill_lines(sk):
+    line = "  %-13s %-30s [%s scope, %s]" % (
+        sk["verdict"], sk["id"], sk["scope"], sk["path"])
+    out = [line]
+    if sk["description"]:
+        out.append("    description: %s" % sk["description"])
+    out.append("    via: %s" % sk["via"])
+    if sk["verdict_note"]:
+        out.append("    note: %s" % sk["verdict_note"])
+    return out
+
+
+def render_skills_text(results, outline=False):
+    lines = [BANNER, "",
+             "SKILLS ARE DISCOVERY, NOT LOADING: this is the set of skills "
+             "each harness", "can SEE from this directory. Harnesses load "
+             "skill bodies on-demand by", "description match (progressive "
+             "disclosure); visible != will be used. (The Oct 22 rejection of "
+             "this", "angle — \"an effective set would overstate loading "
+             "semantics\" — is kept visible", "in the README Limitations.)",
+             ""]
+    for r in results:
+        lines.append("== %s (skills) ==" % r["harness"])
+        if outline:
+            for sk in r["skills"]:
+                lines.append("  %-13s %-30s [%s]" % (
+                    sk["verdict"], sk["id"], sk["scope"]))
+        elif not r["skills"]:
+            lines.append("  (no skills resolve for this directory)")
+        else:
+            for sk in r["skills"]:
+                lines.extend(skill_lines(sk))
+        for w in r["warnings"]:
+            lines.append("  WARNING: %s" % w)
+        for n in r["notes"]:
+            lines.append("  note: %s" % n)
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def render_skills_json(results, directory):
+    return json.dumps({
+        "tool": "agentscope", "version": VERSION, "mode": "skills",
+        "rules_verified": RULES_VERIFIED,
+        "directory": os.path.abspath(directory),
+        "disclaimer": "model of documented harness behavior, not runtime "
+                      "truth; this is the DISCOVERABLE skill set, not the "
+                      "loaded set — skills load on-demand by description "
+                      "match",
+        "harnesses": [{"harness": r["harness"],
+                       "skills": [dict(s) for s in r["skills"]],
+                       "warnings": r["warnings"], "notes": r["notes"]}
+                      for r in results],
+    }, indent=2) + "\n"
+
+
 def render_permissions_text(results, outline=False):
     lines = [BANNER, ""]
     for r in results:
@@ -2460,6 +2899,11 @@ def build_parser():
                          "parsing; rules are shown verbatim, never executed "
                          "or evaluated against real tool calls; --full "
                          "ignored)")
+    ap.add_argument("--skills", action="store_true",
+                    help="resolve the discoverable Agent Skills set per "
+                         "harness instead of instruction files (SKILL.md "
+                         "frontmatter only; scripts/ never read or executed; "
+                         "remote catalogs never fetched; --full ignored)")
     ap.add_argument("--version", action="store_true", help="print version and exit")
     return ap
 
@@ -2484,10 +2928,11 @@ def main(argv=None):
         print("agentscope: not a directory: %s" % args.directory, file=sys.stderr)
         return 2
     modes = [m for m, on in (("mcp", args.mcp), ("hooks", args.hooks),
-                                   ("permissions", args.permissions)) if on]
+                                   ("permissions", args.permissions),
+                                   ("skills", args.skills)) if on]
     if len(modes) > 1:
-        print("agentscope: --mcp, --hooks and --permissions are mutually "
-              "exclusive", file=sys.stderr)
+        print("agentscope: --mcp, --hooks, --permissions and --skills are "
+              "mutually exclusive", file=sys.stderr)
         return 2
     mode = modes[0] if modes else "instructions"
     if args.mcp and args.full:
@@ -2525,6 +2970,10 @@ def main(argv=None):
             sb = {_pr(p) for p in rb["rules"]} | \
                 {_pc(c) for c in rb["context"]}
             what = "permission rules"
+        elif mode == "skills":
+            sa = {(s["id"], s["scope"], s["path"]) for s in ra["skills"]}
+            sb = {(s["id"], s["scope"], s["path"]) for s in rb["skills"]}
+            what = "discoverable skills"
         else:
             sa = {c["path"] for c in ra["contributors"]}
             sb = {c["path"] for c in rb["contributors"]}
@@ -2566,6 +3015,8 @@ def main(argv=None):
             sys.stdout.write(render_hooks_json(results, d))
         elif mode == "permissions":
             sys.stdout.write(render_permissions_json(results, d))
+        elif mode == "skills":
+            sys.stdout.write(render_skills_json(results, d))
         else:
             sys.stdout.write(render_json(results, d))
     else:
@@ -2576,6 +3027,8 @@ def main(argv=None):
         elif mode == "permissions":
             sys.stdout.write(render_permissions_text(results,
                                                      outline=args.outline))
+        elif mode == "skills":
+            sys.stdout.write(render_skills_text(results, outline=args.outline))
         else:
             sys.stdout.write(render_text(results, full=args.full,
                                          outline=args.outline))
@@ -2585,6 +3038,8 @@ def main(argv=None):
         return 0 if any(r["hooks"] for r in results) else 1
     if mode == "permissions":
         return 0 if any(r["rules"] or r["context"] for r in results) else 1
+    if mode == "skills":
+        return 0 if any(r["skills"] for r in results) else 1
     return 0 if any(r["contributors"] for r in results) else 1
 
 

@@ -293,7 +293,7 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.6.0", r.stdout)
+        self.assertIn("1.7.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
             "antigravity"):
@@ -851,7 +851,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.6.0")
+        self.assertEqual(body["version"], "1.7.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",
@@ -1455,3 +1455,190 @@ class AntigravityTests(Base):
         body = json.loads(r.stdout)
         self.assertEqual(body["a"], "claude")
         self.assertEqual(body["b"], "antigravity")
+
+
+def _skill_md(name, desc="does things", extra=""):
+    return "---\nname: %s\ndescription: %s\n%s---\n# %s\n" % (name, desc, extra, name)
+
+
+def _put_skill(home, *parts, name, desc="does things", extra=""):
+    p = os.path.join(home, *parts, name)
+    os.makedirs(p, exist_ok=True)
+    with open(os.path.join(p, "SKILL.md"), "w") as f:
+        f.write(_skill_md(name, desc, extra))
+    return p
+
+
+class SkillsTests(Base):
+    def test_claude_personal_skill_valid(self):
+        root, home = self.tree({})
+        _put_skill(home, ".claude", "skills", name="deploy")
+        r = self.tool(home, "--skills", "--harness", "claude", "--json", root)
+        self.assertEqual(r.returncode, 0)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["skills"][0]["verdict"], "VALID")
+        self.assertEqual(h["skills"][0]["id"], "deploy")
+        self.assertEqual(h["skills"][0]["scope"], "personal")
+
+    def test_name_mismatch_invalid_declared_name_is_id(self):
+        root, home = self.tree({})
+        _put_skill(home, ".claude", "skills", name="deploy",
+                   desc="x", extra="")
+        p = os.path.join(home, ".claude", "skills", "deploy", "SKILL.md")
+        with open(p, "w") as f:
+            f.write("---\nname: WRONG\ndescription: x\n---\n")
+        r = self.tool(home, "--skills", "--harness", "claude", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["skills"][0]["verdict"], "INVALID")
+        # identity = the declared frontmatter name (what the harness keys on)
+        self.assertEqual(h["skills"][0]["id"], "WRONG")
+        self.assertIn("does not match folder name", h["skills"][0]["verdict_note"])
+
+    def test_missing_description_invalid(self):
+        root, home = self.tree({})
+        p = os.path.join(home, ".agents", "skills", "nd")
+        os.makedirs(p, exist_ok=True)
+        with open(os.path.join(p, "SKILL.md"), "w") as f:
+            f.write("---\nname: nd\n---\n")
+        r = self.tool(home, "--skills", "--harness", "codex", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["skills"][0]["verdict"], "INVALID")
+        self.assertIn("description", h["skills"][0]["verdict_note"])
+
+    def test_missing_frontmatter_invalid(self):
+        root, home = self.tree({})
+        p = os.path.join(home, ".agents", "skills", "nf")
+        os.makedirs(p, exist_ok=True)
+        with open(os.path.join(p, "SKILL.md"), "w") as f:
+            f.write("# just a body, no frontmatter\n")
+        r = self.tool(home, "--skills", "--harness", "codex", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["skills"][0]["verdict"], "INVALID")
+        self.assertIn("frontmatter", h["skills"][0]["verdict_note"])
+
+    def test_codex_upward_walk(self):
+        root, home = self.tree({".git": None, "sub": None})
+        _put_skill(root, ".agents", "skills", name="base")
+        r = self.tool(home, "--skills", "--harness", "codex", "--json",
+                      os.path.join(root, "sub"))
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual([s["id"] for s in h["skills"]], ["base"])
+
+    def test_claude_duplicate_personal_wins(self):
+        root, home = self.tree({".git": None})
+        _put_skill(home, ".claude", "skills", name="dup")
+        _put_skill(root, ".claude", "skills", name="dup", desc="project one")
+        r = self.tool(home, "--skills", "--harness", "claude", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        by_scope = {s["scope"]: s for s in h["skills"]}
+        self.assertEqual(by_scope["personal"]["verdict"], "VALID")
+        self.assertEqual(by_scope["project"]["verdict"], "DUPLICATE-NAME")
+        self.assertIn("personal", by_scope["project"]["verdict_note"])
+
+    def test_opencode_v1_uses_frontmatter_name(self):
+        root, home = self.tree({})
+        _put_skill(root, ".opencode", "skills", name="foo", desc="v1")
+        p = os.path.join(root, ".opencode", "skills", "foo", "SKILL.md")
+        with open(p, "w") as f:
+            f.write("---\nname: bar\ndescription: v1\n---\n")
+        r = self.tool(home, "--skills", "--harness", "opencode", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["skills"][0]["id"], "bar")  # v1: frontmatter name
+        self.assertIn("name 'bar' does not match folder name 'foo'",
+                      h["skills"][0]["verdict_note"])
+
+    def test_opencode_v2_uses_path_id(self):
+        root, home = self.tree({"opencode.json": '{"mcp":{"servers":{}}}'})
+        _put_skill(root, ".opencode", "skills", name="foo", desc="v2")
+        r = self.tool(home, "--skills", "--harness", "opencode", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["skills"][0]["id"], "foo")  # v2: path-derived
+        self.assertEqual(h["skills"][0]["verdict"], "VALID")
+        self.assertTrue(any("v2 config detected" in n for n in h["notes"]))
+
+    def test_opencode_remote_catalogs_listed_not_fetched(self):
+        root, home = self.tree({"opencode.json":
+            '{"skills":{"urls":["https://skills.example/x"]}}'})
+        r = self.tool(home, "--skills", "--harness", "opencode", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertTrue(any("never fetches" in n for n in h["notes"]))
+
+    def test_antigravity_global_conflict_both_modeled(self):
+        root, home = self.tree({})
+        _put_skill(home, ".gemini", "config", "skills", name="from-a")
+        _put_skill(home, ".gemini", "antigravity", "skills", name="from-b")
+        r = self.tool(home, "--skills", "--harness", "antigravity",
+                      "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual({s["id"] for s in h["skills"]}, {"from-a", "from-b"})
+        self.assertTrue(any("UNRESOLVED" in n for n in h["notes"]))
+
+    def test_antigravity_workspace_beats_global(self):
+        root, home = self.tree({".git": None})
+        _put_skill(root, ".agents", "skills", name="same", desc="ws")
+        _put_skill(home, ".gemini", "config", "skills", name="same", desc="gl")
+        r = self.tool(home, "--skills", "--harness", "antigravity",
+                      "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        by_scope = {s["scope"]: s for s in h["skills"]}
+        self.assertEqual(by_scope["workspace"]["verdict"], "VALID")
+        self.assertEqual(by_scope["global"]["verdict"], "DUPLICATE-NAME")
+
+    def test_cursor_reads_claude_compat_dir(self):
+        root, home = self.tree({".git": None})
+        _put_skill(root, ".claude", "skills", name="compat")
+        r = self.tool(home, "--skills", "--harness", "cursor", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual([s["id"] for s in h["skills"]], ["compat"])
+
+    def test_gemini_interactive_loading_note(self):
+        root, home = self.tree({})
+        _put_skill(home, ".gemini", "skills", name="g1")
+        r = self.tool(home, "--skills", "--harness", "gemini", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertTrue(any("activate_skill" in n for n in h["notes"]))
+
+    def test_never_executes_skill_scripts(self):
+        root, home = self.tree({})
+        marker = os.path.join(self._tmp[0] if self._tmp else root, "MARKER")
+        sp = _put_skill(root, ".agents", "skills", name="tricky")
+        scripts = os.path.join(sp, "scripts")
+        os.makedirs(scripts, exist_ok=True)
+        with open(os.path.join(scripts, "evil.sh"), "w") as f:
+            f.write("#!/bin/sh\ntouch %s\n" % marker)
+        r = self.tool(home, "--skills", "--harness", "codex", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_no_network_imports(self):
+        src = open(TOOL).read()
+        for mod in ("import socket", "import urllib", "import http.client",
+                    "from urllib", "from socket"):
+            self.assertNotIn(mod, src)
+
+    def test_exit_1_when_no_skills(self):
+        root, home = self.tree({})
+        r = self.tool(home, "--skills", "--harness", "claude", root)
+        self.assertEqual(r.returncode, 1)
+
+    def test_diff_harness_skills_identity(self):
+        root, home = self.tree({".git": None})
+        _put_skill(root, ".agents", "skills", name="shared")
+        r = self.tool(home, "--diff-harness", "codex", "cursor", "--skills", "--json", root)
+        self.assertEqual(r.returncode, 0)
+        body = json.loads(r.stdout)
+        self.assertEqual(body["what"], "discoverable skills")
+        self.assertEqual(len(body["in_both"]), 1)
+
+    def test_claude_plugin_skills_namespaced(self):
+        root, home = self.tree({})
+        _put_skill(home, ".claude", "plugins", "myplug", "skills", name="ps")
+        r = self.tool(home, "--skills", "--harness", "claude", "--json", root)
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["skills"][0]["id"], "myplug:ps")
+
+    def test_mutual_exclusion_with_other_modes(self):
+        root, home = self.tree({})
+        r = self.tool(home, "--skills", "--mcp", root)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("mutually exclusive", r.stderr)

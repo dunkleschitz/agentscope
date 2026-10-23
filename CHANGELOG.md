@@ -1,5 +1,29 @@
 # CHANGELOG — agentscope
 
+## 1.7.0 (2026-10-23)
+
+Fifth mode: `--skills` — "which skills will harness X actually SEE for
+directory Y?" (discoverable Agent Skills per harness per directory).
+Resolves every `<name>/SKILL.md` in each harness's documented skill
+locations (personal + project, with per-harness extras: Claude plugin
+skills namespaced `plugin:skill`, Cursor's `.claude/skills/` +
+`.codex/skills/` compatibility dirs, Codex's upward `.agents/skills/`
+walk, OpenCode's six locations × v1/v2, Antigravity's workspace +
+dual global candidates), with verdicts VALID / INVALID (name≠folder,
+bad frontmatter, missing description — reported, never silently
+skipped) / DUPLICATE-NAME (per-harness precedence winner named:
+claude enterprise>personal>project, antigravity workspace>global).
+Heuristic SKILL.md frontmatter parser (name/description only); skills'
+`scripts/` never read or executed; remote catalogs (opencode
+`skills.urls`) listed, never fetched; `--full` ignored.
+**Discovery, not loading:** the mode answers the Oct 22 rejection's
+objection structurally — harnesses load skill bodies on-demand by
+description match, so the report is the visible set, never an
+"effective loaded set". Mutually exclusive with --mcp/--hooks/
+--permissions; exit 0 found / 1 none / 2 usage; --diff-harness on
+(id, scope, path). 19 new hermetic tests (126 total). Design review:
+DESIGN-skills.md.
+
 ## 1.6.0 (2026-10-23)
 
 Seventh harness: `--harness antigravity` (Google's agent IDE/CLI/App),

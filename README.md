@@ -1,4 +1,4 @@
-# agentscope — effective-instruction, effective-MCP, and effective-hook resolver
+# agentscope — effective-instruction, effective-MCP, effective-hook, and effective-permissions resolver
 
 "What instructions does harness X actually load for directory Y?" —
 and, since v1.1.0, "which **MCP servers** does it actually load?" —
@@ -115,6 +115,53 @@ Per-harness hook sources (verified via web search, 2026-10-22):
 Exit codes in `--hooks` mode: **0** = at least one hook resolves;
 **1** = none resolve; **2** = usage error.
 
+## `--permissions`: effective allow/deny rule resolution (v1.3.0)
+
+"Which allow/deny/ask rules does harness X actually enforce for
+directory Y?" — the same effective-resolution question, for the
+permission rules that decide whether an agent's tool call flies,
+prompts, or dies. Today it is answered only by prose guides or by
+asking the harness itself; config validators (agnix) check hygiene and
+policy engines enforce at runtime, but none statically resolves the
+merged effective set.
+
+```bash
+agentscope --permissions                     # all harnesses, current dir
+agentscope --permissions --harness claude .
+agentscope --permissions --outline           # rule + context counts only
+agentscope --permissions --json
+agentscope --permissions --diff-harness claude codex .
+```
+
+Reports, per harness: the merged allow/deny/ask/filesystem rules (kind,
+rule text, scope, source file), plus the mode-level context that
+frames them (`sandbox_mode`, `approval_policy`, active permission
+profile, Gemini's `tools.sandbox`). `--mcp`, `--hooks`, and
+`--permissions` are mutually exclusive; `--full` is accepted but has no
+additional effect in `--permissions` mode (the text output already
+shows complete rules).
+
+**Read-only by construction:** rule text is shown verbatim for the
+operator to inspect — a `deny` rule may name a destructive command,
+and it is never executed, never passed to a shell, and never evaluated
+against real tool calls. (There is a test that plants a
+`Bash(touch <marker>)` deny rule and asserts the marker is never
+created.) Permission rules are your own config (paths and patterns),
+so the output is no more sensitive than the config files themselves.
+
+Per-harness permission sources (verified via web search, 2026-10-22):
+
+| Harness | Sources |
+|---|---|
+| `claude` | `~/.claude/settings.json` (user), `./.claude/settings.json` (project), `./.claude/settings.local.json` (personal); `permissions.allow` / `.deny` / `.ask` lists; rules emit in evaluation order (deny → ask → allow — the first match decides, specificity and file origin don't matter) |
+| `codex` | `~/.codex/config.toml` (global), `./.codex/config.toml` (project, trusted projects only); `default_permissions` selects the active named profile; `[permissions.<name>.filesystem]` path→`write`/`read`/`none` tables (incl. the `:project_roots` token shape); `sandbox_mode`, `approval_policy` (incl. granular tables) as context |
+| `gemini` | `~/.gemini/settings.json` (global), `./.gemini/settings.json` (project); `tools.core` allowlist + `tools.sandbox` (also the older top-level `coreTools` shape); env vars outrank both but aren't visible to a static resolver |
+| `cursor` | no documented static allow/deny rule format found — always empty, with a note |
+| `copilot` | no documented static allow/deny rule format found — always empty, with a note |
+
+Exit codes in `--permissions` mode: **0** = at least one rule or
+context setting resolves; **1** = none resolve; **2** = usage error.
+
 ## Supported harnesses
 
 | Harness | What agentscope resolves |
@@ -158,11 +205,18 @@ session hinges on it, confirm against the harness's own docs.
   policy hooks or plugin-declared hooks (Copilot); hook merge order
   across scopes is undocumented and reported as `[inferred]` where
   assumed.
+- `--permissions` resolves the rule set on disk, not the harness's
+  runtime decision: CLI flags (Codex), session-local rules (Claude
+  `/permissions` changes), and environment-variable overrides (Gemini)
+  are invisible to a static resolver and flagged as notes. Cursor and
+  Copilot have no documented static allow/deny format and resolve empty.
+  Rule text is shown verbatim; treat the output as you would the config
+  file itself.
 
 ## Testing
 
 ```bash
-python3 -m unittest test_agentscope -v   # 45 tests
+python3 -m unittest test_agentscope -v   # 73 tests
 ```
 
 Stdlib only (Python 3.11+, for `tomllib`). No dependencies. Strictly

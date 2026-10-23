@@ -293,7 +293,7 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.2.0", r.stdout)
+        self.assertIn("1.3.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini"):
             self.assertIn(h, r.stdout)
@@ -724,7 +724,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.2.0")
+        self.assertEqual(body["version"], "1.3.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",
@@ -745,3 +745,183 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", root)
         self.assertEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(marker))
+
+
+class PermissionsTests(Base):
+    def claude_settings(self, home, root):
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        os.makedirs(os.path.join(root, ".claude"), exist_ok=True)
+        with open(os.path.join(home, ".claude", "settings.json"), "w") as f:
+            json.dump({"permissions": {
+                "allow": ["Bash(git status)"],
+                "deny": ["Bash(rm -rf *)"]}}, f)
+        with open(os.path.join(root, ".claude", "settings.json"), "w") as f:
+            json.dump({"permissions": {"ask": ["WebFetch"]}}, f)
+        with open(os.path.join(root, ".claude", "settings.local.json"), "w") as f:
+            json.dump({"permissions": {"allow": ["Read(./notes/**)"]}}, f)
+
+    def perm_json(self, home, args):
+        r = self.tool(home, "--permissions", "--json", *args)
+        self.assertEqual(r.returncode, 0)
+        body = json.loads(r.stdout)
+        return {h["harness"]: h for h in body["harnesses"]}
+
+    def test_claude_three_scopes_merge(self):
+        root, home = self.tree({".git": None})
+        self.claude_settings(home, root)
+        h = self.perm_json(home, ["--harness", "claude", root])["claude"]
+        by_scope = {}
+        for rule in h["rules"]:
+            by_scope.setdefault(rule["scope"], []).append(
+                (rule["kind"], rule["rule"]))
+        # rules emit in evaluation order: deny, ask, allow
+        self.assertEqual(by_scope["user"],
+                         [("deny", "Bash(rm -rf *)"),
+                          ("allow", "Bash(git status)")])
+        self.assertEqual(by_scope["project"], [("ask", "WebFetch")])
+        self.assertEqual(by_scope["local"], [("allow", "Read(./notes/**)")])
+        self.assertTrue(any("deny" in n and "allow" in n for n in h["notes"]))
+
+    def test_claude_no_settings_exit_1(self):
+        root, home = self.tree({".git": None})
+        r = self.tool(home, "--permissions", "--harness", "claude", root)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no permission rules found", r.stdout)
+
+    def test_claude_malformed_json_forgiven(self):
+        root, home = self.tree({".git": None})
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        with open(os.path.join(home, ".claude", "settings.json"), "w") as f:
+            f.write("{not json")
+        r = self.tool(home, "--permissions", "--harness", "claude", root)
+        self.assertEqual(r.returncode, 1)  # nothing resolved, no crash
+
+    def test_codex_profiles_and_context(self):
+        root, home = self.tree({".git": None})
+        os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+        with open(os.path.join(home, ".codex", "config.toml"), "w") as f:
+            f.write('default_permissions = "hardened"\n'
+                    'sandbox_mode = "workspace-write"\n'
+                    'approval_policy = "on-request"\n'
+                    '[permissions.hardened.filesystem]\n'
+                    '":project_roots" = { "." = "write", "**/*.env" = "none" }\n'
+                    '"/home/u/.ssh" = "none"\n')
+        os.makedirs(os.path.join(root, ".codex"), exist_ok=True)
+        with open(os.path.join(root, ".codex", "config.toml"), "w") as f:
+            f.write('default_permissions = "proj"\n')
+        h = self.perm_json(home, ["--harness", "codex", root])["codex"]
+        rules = {(r["scope"], r["kind"], r["rule"]) for r in h["rules"]}
+        self.assertIn(("profile:hardened", "fs",
+                       ":project_roots . => write"), rules)
+        self.assertIn(("profile:hardened", "fs",
+                       ":project_roots **/*.env => none"), rules)
+        self.assertIn(("profile:hardened", "fs",
+                       "/home/u/.ssh => none"), rules)
+        ctx = {(c["name"], c["value"]) for c in h["context"]}
+        self.assertIn(("default_permissions", "hardened"), ctx)
+        self.assertIn(("sandbox_mode", "workspace-write"), ctx)
+        self.assertIn(("approval_policy", "on-request"), ctx)
+        vias = [c["via"] for c in h["context"]] + \
+            [r["via"] for r in h["rules"]]
+        self.assertTrue(any("trusted" in v for v in vias))
+
+    def test_codex_flat_filesystem_and_granular_approval(self):
+        root, home = self.tree({".git": None})
+        os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+        with open(os.path.join(home, ".codex", "config.toml"), "w") as f:
+            f.write('approval_policy = { sandbox_approval = true, '
+                    'rules = true }\n'
+                    '[permissions.ci.filesystem]\n'
+                    '"/srv/data" = "read"\n')
+        h = self.perm_json(home, ["--harness", "codex", root])["codex"]
+        self.assertIn(("profile:ci", "fs", "/srv/data => read"),
+                      {(r["scope"], r["kind"], r["rule"]) for r in h["rules"]})
+        ap = [c for c in h["context"] if c["name"] == "approval_policy"][0]
+        self.assertIn("sandbox_approval", ap["value"])
+
+    def test_gemini_core_allowlist_and_sandbox(self):
+        root, home = self.tree({".git": None})
+        os.makedirs(os.path.join(home, ".gemini"), exist_ok=True)
+        with open(os.path.join(home, ".gemini", "settings.json"), "w") as f:
+            json.dump({"tools": {"core": ["ReadFileTool"],
+                                 "sandbox": "docker"}}, f)
+        os.makedirs(os.path.join(root, ".gemini"), exist_ok=True)
+        with open(os.path.join(root, ".gemini", "settings.json"), "w") as f:
+            json.dump({"coreTools": ["ShellTool(gh pr view)"]}, f)
+        h = self.perm_json(home, ["--harness", "gemini", root])["gemini"]
+        rules = {(r["scope"], r["rule"]) for r in h["rules"]}
+        self.assertIn(("global", "ReadFileTool"), rules)
+        self.assertIn(("project", "ShellTool(gh pr view)"), rules)
+        ctx = {(c["name"], c["value"]) for c in h["context"]}
+        self.assertIn(("tools.sandbox", "docker"), ctx)
+
+    def test_cursor_copilot_unmodeled(self):
+        root, home = self.tree({".git": None})
+        for name in ("cursor", "copilot"):
+            r = self.tool(home, "--permissions", "--harness", name, root)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("no documented static allow/deny", r.stdout)
+
+    def test_exit_codes(self):
+        root, home = self.tree({".git": None})
+        r = self.tool(home, "--permissions", root)
+        self.assertEqual(r.returncode, 1)  # nothing anywhere
+        self.claude_settings(home, root)
+        r = self.tool(home, "--permissions", root)
+        self.assertEqual(r.returncode, 0)
+        r = self.tool(home, "--permissions", "/nonexistent-dir-xyz")
+        self.assertEqual(r.returncode, 2)
+
+    def test_modes_mutually_exclusive(self):
+        root, home = self.tree({".git": None})
+        for flags in (["--permissions", "--hooks"],
+                      ["--permissions", "--mcp"]):
+            r = self.tool(home, *flags, root)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("mutually exclusive", r.stderr)
+
+    def test_outline_counts(self):
+        root, home = self.tree({".git": None})
+        self.claude_settings(home, root)
+        r = self.tool(home, "--permissions", "--outline", "--harness",
+                      "claude", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("4 rule(s)", r.stdout)
+
+    def test_diff_harness_permissions(self):
+        root, home = self.tree({".git": None})
+        self.claude_settings(home, root)
+        r = self.tool(home, "--permissions", "--diff-harness", "claude",
+                      "gemini", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("permission rules", r.stdout)
+        self.assertIn("Bash(git status)", r.stdout)
+
+    def test_rules_never_executed(self):
+        # A rule naming a command that would create a file must not run.
+        tmpdir = tempfile.mkdtemp()
+        self._tmp.append(tmpdir)
+        marker = os.path.join(tmpdir, "pwned")
+        root, home = self.tree({".git": None})
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        with open(os.path.join(home, ".claude", "settings.json"), "w") as f:
+            json.dump({"permissions": {"deny": ["Bash(touch %s)" % marker]}},
+                      f)
+        r = self.tool(home, "--permissions", "--harness", "claude", root)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn(marker, r.stdout)  # shown verbatim
+        self.assertFalse(os.path.exists(marker))  # never executed
+
+    def test_json_shape(self):
+        root, home = self.tree({".git": None})
+        self.claude_settings(home, root)
+        r = self.tool(home, "--permissions", "--json", root)
+        self.assertEqual(r.returncode, 0)
+        body = json.loads(r.stdout)
+        self.assertEqual(body["mode"], "permissions")
+        self.assertIn("not runtime truth", body["disclaimer"])
+        cl = [h for h in body["harnesses"]
+              if h["harness"] == "claude"][0]
+        rule = cl["rules"][0]
+        for k in ("kind", "rule", "source", "scope", "via", "tag", "note"):
+            self.assertIn(k, rule)

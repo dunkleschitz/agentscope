@@ -1,5 +1,30 @@
 # CHANGELOG — agentscope
 
+## 1.3.0 (2026-10-22)
+
+`--permissions` mode: effective allow/deny rule resolution per harness
+for a directory — the fourth mode on agentscope's effective-resolution
+axis (instructions, MCP, hooks, now permissions). Answers "which
+allow/deny rules does harness X actually enforce for directory Y?"
+from config files alone: merged allow/deny/ask/filesystem rules with
+scope, source file, and [documented]/[inferred] tags, plus mode-level
+context (`sandbox_mode`, `approval_policy`, active permission profile,
+Gemini's `tools.sandbox`). Per-harness layouts verified via web search
+2026-10-22: Claude's three settings.json scopes (rules emitted in the
+documented deny → ask → allow evaluation order), Codex's global+project
+config.toml with named `[permissions.<name>.filesystem]` profiles and
+the `:project_roots` token shape, Gemini's global+project
+settings.json `tools.core`/`tools.sandbox` (plus the older `coreTools`
+shape); Cursor and Copilot have no documented static allow/deny format
+and resolve empty with a note. Read-only by construction: rules shown
+verbatim, never executed or evaluated against real tool calls (a
+planted `Bash(touch <marker>)` deny rule asserts the marker is never
+created). `--diff-harness` works in `--permissions` mode; `--mcp`,
+`--hooks`, `--permissions` mutually exclusive; exit 0 rules-or-context
+/ 1 none / 2 usage. 73 tests (13 new), all green. Dogfooded with
+doccover (flagged the missing `--permissions` README docs, now fixed;
+2 stale refs are prose-example false positives) and clicheck (15/15).
+
 ## 1.2.0 (2026-10-22)
 
 `--hooks` mode: effective hook resolution per harness for a directory —

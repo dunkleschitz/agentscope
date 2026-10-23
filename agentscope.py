@@ -20,10 +20,12 @@ loaded set per harness for a directory, from the files on disk.
     agentscope --diff-harness codex claude apps/web
     agentscope --hooks                          # effective hook sets
     agentscope --hooks --harness claude .
+    agentscope --permissions                    # effective allow/deny rule sets
 
-Exit codes: 0 = at least one contributing file resolved; 1 = no instruction
-files found for the selected harness(es) (the harness would load nothing);
-2 = usage error.
+Exit codes: 0 = at least one contributing item resolved; 1 = nothing resolved
+for the selected harness(es) (the harness would enforce nothing); 2 = usage
+error. In --permissions mode, "contributing item" = a rule or a context
+setting (sandbox_mode, approval_policy, ...).
 
 Stdlib only. Strictly READ-ONLY: never writes, never executes anything, never
 touches the network. Safe to run anywhere.
@@ -49,7 +51,7 @@ import os
 import re
 import sys
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 RULES_VERIFIED = "2026-10-22"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -1310,6 +1312,239 @@ HOOK_RESOLVERS = {"codex": resolve_hooks_codex, "claude": resolve_hooks_claude,
 RESOLVERS["hooks"] = HOOK_RESOLVERS
 
 # --------------------------------------------------------------------------
+# permissions mode (--permissions, v1.3.0)
+# --------------------------------------------------------------------------
+# Which allow/deny/ask rules a harness actually enforces for a directory.
+# Pure config parsing: rule text is shown verbatim but NEVER executed or
+# evaluated against real tool calls — this is the merged rule set on disk,
+# not the harness's runtime decision. Same honesty model as the other modes.
+
+
+def new_perm_resolution(harness):
+    return {"harness": harness, "rules": [], "context": [], "warnings": [],
+            "notes": []}
+
+
+def add_perm_rule(res, kind, rule, source, scope, via, tag=DOC, note=""):
+    res["rules"].append({"kind": kind, "rule": str(rule), "source": source,
+                         "scope": scope, "via": via, "tag": tag,
+                         "note": note})
+
+
+def add_perm_context(res, name, value, source, scope, via, tag=DOC, note=""):
+    res["context"].append({"name": name, "value": str(value), "source": source,
+                           "scope": scope, "via": via, "tag": tag,
+                           "note": note})
+
+
+def _perm_claude_scope(res, path, scope, via):
+    obj = read_json_obj(path)
+    if obj is None:
+        return
+    perms = obj.get("permissions")
+    if not isinstance(perms, dict):
+        return
+    for kind in ("deny", "ask", "allow"):
+        entries = perms.get(kind)
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            add_perm_rule(res, kind, e, path, scope, via)
+
+
+def resolve_permissions_claude(d):
+    res = new_perm_resolution("claude")
+    root = git_root(d) or d
+    _perm_claude_scope(
+        res, os.path.join(home(), ".claude", "settings.json"), "user",
+        "[documented] user settings merge with project and local scopes")
+    _perm_claude_scope(
+        res, os.path.join(root, ".claude", "settings.json"), "project",
+        "[documented] project settings apply inside this repo")
+    _perm_claude_scope(
+        res, os.path.join(root, ".claude", "settings.local.json"), "local",
+        "[documented] local settings (gitignored) apply inside this repo")
+    res["notes"].append(
+        "[documented] evaluation order: deny rules first, then ask, then "
+        "allow — the FIRST match decides; specificity and file origin do "
+        "not change the outcome (verified 2026-10-22)")
+    return res
+
+
+def _toml_compact(value):
+    if isinstance(value, dict):
+        return "{" + ", ".join("%s=%s" % (k, _toml_compact(v))
+                               for k, v in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_compact(v) for v in value) + "]"
+    return str(value)
+
+
+def _perm_codex_scope(res, path, scope, via):
+    obj = read_toml_obj(path)
+    if obj is None:
+        return
+    default = obj.get("default_permissions")
+    if isinstance(default, str):
+        add_perm_context(res, "default_permissions", default, path, scope,
+                         via, note="selects the active permission profile")
+    sandbox = obj.get("sandbox_mode")
+    if sandbox is None:
+        sandbox = obj.get("sandbox")  # [inferred] older key
+    if isinstance(sandbox, str):
+        add_perm_context(res, "sandbox_mode", sandbox, path, scope, via)
+    approval = obj.get("approval_policy")
+    if approval is None:
+        approval = obj.get("ask_for_approval")  # [inferred] older key
+    if approval is not None:
+        add_perm_context(res, "approval_policy", _toml_compact(approval),
+                         path, scope, via,
+                         tag=DOC if isinstance(approval, str) else INF,
+                         note="[inferred] granular table shown verbatim; "
+                         "merge semantics undocumented" if isinstance(
+                             approval, dict) else "")
+    profiles = obj.get("permissions")
+    if not isinstance(profiles, dict):
+        return
+    for pname, pbody in profiles.items():
+        if not isinstance(pbody, dict):
+            res["warnings"].append(
+                "profile %r in %s is not a table; skipped" % (pname, path))
+            continue
+        fs = pbody.get("filesystem")
+        if not isinstance(fs, dict):
+            continue
+        # [documented] shape: [permissions.<name>.filesystem] with
+        # "<token-or-path>" = "<level>" or a sub-table of pattern = level
+        for pat, level in fs.items():
+            if isinstance(level, dict):
+                for sub, lvl in level.items():
+                    add_perm_rule(res, "fs", "%s %s => %s" % (pat, sub, lvl),
+                                  path, "profile:%s" % pname, via,
+                                  note="filesystem access level")
+            else:
+                add_perm_rule(res, "fs", "%s => %s" % (pat, level),
+                              path, "profile:%s" % pname, via,
+                              note="filesystem access level")
+
+
+def resolve_permissions_codex(d):
+    res = new_perm_resolution("codex")
+    root = git_root(d) or d
+    _perm_codex_scope(
+        res, os.path.join(home(), ".codex", "config.toml"), "global",
+        "[documented] global config applies to all projects")
+    _perm_codex_scope(
+        res, os.path.join(root, ".codex", "config.toml"), "project",
+        "[documented] project config overrides global, but ONLY loads in "
+        "trusted projects [inferred] untrusted projects see global only")
+    res["notes"].append(
+        "[documented] resolution order: CLI flags > active profile > "
+        "config.toml defaults > built-in defaults; --flags are not visible "
+        "to a static resolver (verified 2026-10-22)")
+    return res
+
+
+def _perm_gemini_scope(res, path, scope, via):
+    obj = read_json_obj(path)
+    if obj is None:
+        return
+    tools = obj.get("tools")
+    core = None
+    if isinstance(tools, dict):
+        core = tools.get("core")  # [documented] enterprise shape
+        sandbox = tools.get("sandbox")
+        if sandbox is not None:
+            add_perm_context(res, "tools.sandbox", sandbox, path, scope, via)
+    if core is None:
+        core = obj.get("coreTools")  # [documented] older/CI shape
+    if isinstance(core, list):
+        for e in core:
+            add_perm_rule(res, "allow", e, path, scope, via)
+
+
+def resolve_permissions_gemini(d):
+    res = new_perm_resolution("gemini")
+    root = git_root(d) or d
+    _perm_gemini_scope(
+        res, os.path.join(home(), ".gemini", "settings.json"), "global",
+        "[documented] global settings")
+    _perm_gemini_scope(
+        res, os.path.join(root, ".gemini", "settings.json"), "project",
+        "[documented] project settings")
+    res["notes"].append(
+        "[documented] hierarchy: env vars > project > global > defaults; env "
+        "overrides are not visible to a static resolver (verified "
+        "2026-10-22)")
+    return res
+
+
+def resolve_permissions_cursor(d):
+    res = new_perm_resolution("cursor")
+    res["notes"].append(
+        "[inferred] no documented static allow/deny rule format found for "
+        "Cursor (verified 2026-10-22); nothing to resolve")
+    return res
+
+
+def resolve_permissions_copilot(d):
+    res = new_perm_resolution("copilot")
+    res["notes"].append(
+        "[inferred] no documented static allow/deny rule format found for "
+        "GitHub Copilot CLI (verified 2026-10-22); nothing to resolve")
+    return res
+
+
+PERM_RESOLVERS = {"codex": resolve_permissions_codex,
+                  "claude": resolve_permissions_claude,
+                  "cursor": resolve_permissions_cursor,
+                  "copilot": resolve_permissions_copilot,
+                  "gemini": resolve_permissions_gemini}
+RESOLVERS["permissions"] = PERM_RESOLVERS
+
+
+def render_permissions_text(results, outline=False):
+    lines = [BANNER, ""]
+    for r in results:
+        lines.append("== %s ==" % r["harness"])
+        if outline:
+            lines.append("  %d rule(s), %d context setting(s)" % (
+                len(r["rules"]), len(r["context"])))
+        elif not r["rules"] and not r["context"]:
+            lines.append("  (no permission rules found)")
+        else:
+            for c in r["context"]:
+                lines.append("  [%s|%s] %s = %s" % (
+                    c["scope"], c["tag"], c["name"], c["value"]))
+                if c["note"]:
+                    lines.append("      note: %s" % c["note"])
+            for p in r["rules"]:
+                lines.append("  [%s|%s] %s: %s" % (
+                    p["scope"], p["tag"], p["kind"], p["rule"]))
+                if p["note"]:
+                    lines.append("      note: %s" % p["note"])
+        for w in r["warnings"]:
+            lines.append("  WARNING: %s" % w)
+        for n in r["notes"]:
+            lines.append("  note: %s" % n)
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def render_permissions_json(results, directory):
+    return json.dumps({
+        "tool": "agentscope", "version": VERSION,
+        "rules_verified": RULES_VERIFIED,
+        "directory": os.path.abspath(directory), "mode": "permissions",
+        "disclaimer": "model of documented harness behavior, not runtime truth",
+        "harnesses": [{
+            "harness": r["harness"], "rules": r["rules"],
+            "context": r["context"], "warnings": r["warnings"],
+            "notes": r["notes"],
+        } for r in results],
+    }, indent=2) + "\n"
+
+# --------------------------------------------------------------------------
 # output
 # --------------------------------------------------------------------------
 
@@ -1412,6 +1647,12 @@ def build_parser():
                     help="resolve the effective hook set per harness "
                          "instead of instruction files (pure config parsing; "
                          "hook commands are never executed; --full ignored)")
+    ap.add_argument("--permissions", action="store_true",
+                    help="resolve the effective allow/deny/ask rule set per "
+                         "harness instead of instruction files (pure config "
+                         "parsing; rules are shown verbatim, never executed "
+                         "or evaluated against real tool calls; --full "
+                         "ignored)")
     ap.add_argument("--version", action="store_true", help="print version and exit")
     return ap
 
@@ -1435,10 +1676,11 @@ def main(argv=None):
     if not os.path.isdir(d):
         print("agentscope: not a directory: %s" % args.directory, file=sys.stderr)
         return 2
-    modes = [m for m, on in (("mcp", args.mcp), ("hooks", args.hooks)) if on]
+    modes = [m for m, on in (("mcp", args.mcp), ("hooks", args.hooks),
+                                   ("permissions", args.permissions)) if on]
     if len(modes) > 1:
-        print("agentscope: --mcp and --hooks are mutually exclusive",
-              file=sys.stderr)
+        print("agentscope: --mcp, --hooks and --permissions are mutually "
+              "exclusive", file=sys.stderr)
         return 2
     mode = modes[0] if modes else "instructions"
     if args.mcp and args.full:
@@ -1466,6 +1708,16 @@ def main(argv=None):
             sa = {_hk(h) for h in ra["hooks"]}
             sb = {_hk(h) for h in rb["hooks"]}
             what = "hooks"
+        elif mode == "permissions":
+            def _pr(p):
+                return "%s|%s|%s" % (p["scope"], p["kind"], p["rule"])
+            def _pc(c):
+                return "context|%s|%s" % (c["name"], c["value"])
+            sa = {_pr(p) for p in ra["rules"]} | \
+                {_pc(c) for c in ra["context"]}
+            sb = {_pr(p) for p in rb["rules"]} | \
+                {_pc(c) for c in rb["context"]}
+            what = "permission rules"
         else:
             sa = {c["path"] for c in ra["contributors"]}
             sb = {c["path"] for c in rb["contributors"]}
@@ -1505,6 +1757,8 @@ def main(argv=None):
             sys.stdout.write(render_mcp_json(results, d))
         elif mode == "hooks":
             sys.stdout.write(render_hooks_json(results, d))
+        elif mode == "permissions":
+            sys.stdout.write(render_permissions_json(results, d))
         else:
             sys.stdout.write(render_json(results, d))
     else:
@@ -1512,6 +1766,9 @@ def main(argv=None):
             sys.stdout.write(render_mcp_text(results, outline=args.outline))
         elif mode == "hooks":
             sys.stdout.write(render_hooks_text(results, outline=args.outline))
+        elif mode == "permissions":
+            sys.stdout.write(render_permissions_text(results,
+                                                     outline=args.outline))
         else:
             sys.stdout.write(render_text(results, full=args.full,
                                          outline=args.outline))
@@ -1519,6 +1776,8 @@ def main(argv=None):
         return 0 if any(r["servers"] for r in results) else 1
     if mode == "hooks":
         return 0 if any(r["hooks"] for r in results) else 1
+    if mode == "permissions":
+        return 0 if any(r["rules"] or r["context"] for r in results) else 1
     return 0 if any(r["contributors"] for r in results) else 1
 
 

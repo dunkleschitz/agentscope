@@ -1,5 +1,31 @@
 # CHANGELOG — agentscope
 
+## 1.10.0 (2026-10-23)
+
+Tenth harness `--mcp` model: `--harness roo` — "which MCP servers will
+Roo Code actually load for directory Y?" Project scope `.roo/mcp.json`
+(auto-detected at the workspace root) + global scope `mcp_settings.json`
+in the extension's VS Code `globalStorage` settings dir (filename
+verified in current Roo-Code source, `GlobalFileNames.mcpSettings`;
+on-disk layout `[inferred]` from globalStorage conventions, coverage
+reported per run). Validation semantics mirror Roo Code's own
+`validateServerConfig` in `McpHub.ts` (verified vs RooCodeInc/Roo-Code@
+main 2026-10-23): `type` ∈ stdio/sse/streamable-http, type optional on
+command-based configs (defaults stdio), mixed `command`+`url` fields
+rejected, `url` without explicit `type` rejected, neither-field
+rejected — invalid entries surface as warnings, exactly as Roo refuses
+them at runtime. Documented precedence (project wins on same-name
+collisions, from the official MCP docs) applied loudly: the dropped
+global entry is named in the notes. `disabled` servers listed as
+tracked-but-not-connected; `${env:VAR}` interpolation in `args` noted
+(name shown verbatim, value never resolved — same names-only policy as
+the rest of `--mcp`). Transports render as stdio/http with the exact
+Roo type in the note. 7 new hermetic tests (161 total; two real bugs
+caught during the build: a global-vs-project precedence miss in the
+removal logic, and an over-strict test assertion on `${env:VAR}` names —
+tool correct on the second); dogfood doccover + clicheck pending.
+Fulfills the ROADMAP "`.roo/mcp.json` future `--mcp` candidate" note.
+
 ## 1.9.0 (2026-10-23)
 
 Ninth harness: `--harness roo` (Roo Code — VS Code/Desktop/CLI agent),

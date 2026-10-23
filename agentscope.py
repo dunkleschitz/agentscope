@@ -54,7 +54,7 @@ import os
 import re
 import sys
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 RULES_VERIFIED = "2026-10-23"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -1863,13 +1863,155 @@ def resolve_mcp_cline(d):
     return res
 
 
+def mcp_from_roo_block(res, block, source, scope, via):
+    """Parse a Roo Code mcpServers map with Roo's validation semantics.
+
+    Verified 2026-10-23 vs the official MCP docs (roocodeinc.github.io/
+    Roo-Code/features/mcp/using-mcp-in-roo/) and McpHub.ts at
+    RooCodeInc/Roo-Code@main (validateServerConfig / ServerConfigSchema):
+      - type must be one of 'stdio' | 'sse' | 'streamable-http'
+      - type is optional for command-based configs (defaults to 'stdio')
+      - mixing 'command' with 'url' fields is rejected at runtime
+      - a 'url' without an explicit type is rejected at runtime
+      - neither 'command' nor 'url' is rejected at runtime
+      - args may reference system env vars as ${env:VARIABLE_NAME}
+    We report Roo's verdict, never invent it: invalid entries are listed
+    as warnings and skipped, exactly as Roo refuses them.
+    """
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        res["warnings"].append(
+            "malformed mcpServers map in %s (expected an object); skipped"
+            % source)
+        return
+    for name, entry in block.items():
+        if not isinstance(entry, dict):
+            res["warnings"].append(
+                "server %r in %s is not an object; skipped" % (name, source))
+            continue
+        stype = entry.get("type")
+        command = entry.get("command")
+        url = entry.get("url")
+        bad = None
+        if command is not None and url is not None:
+            bad = ("mixes 'command' with 'url'; Roo Code rejects mixed "
+                   "stdio/remote fields (invalid)")
+        elif url is not None and stype not in ("sse", "streamable-http"):
+            bad = ("has a 'url' but no explicit type; Roo Code requires "
+                   "type: 'sse' or 'streamable-http' (invalid)")
+        elif command is None and url is None:
+            bad = ("has neither 'command' nor 'url'; Roo Code requires one "
+                   "of them (invalid)")
+        elif stype is not None and stype not in (
+                "stdio", "sse", "streamable-http"):
+            bad = ("unknown type %r; Roo Code accepts only 'stdio', 'sse' "
+                   "and 'streamable-http' (invalid)" % (stype,))
+        elif stype == "stdio" and command is None:
+            bad = ("type 'stdio' without 'command' (invalid)")
+        elif stype in ("sse", "streamable-http") and url is None:
+            bad = ("type %r without 'url' (invalid)" % (stype,))
+        if bad:
+            res["warnings"].append(
+                "server %r in %s: %s" % (name, source, bad))
+            continue
+        eff_type = stype or "stdio"
+        transport = "http" if eff_type in ("sse", "streamable-http") else "stdio"
+        note = "[documented] type: %s" % eff_type
+        if entry.get("disabled"):
+            note += "; DISABLED in config (tracked, not connected)"
+        if entry.get("alwaysAllow"):
+            note += "; alwaysAllow: %s" % ", ".join(
+                str(t) for t in entry["alwaysAllow"])
+        if entry.get("disabledTools"):
+            note += "; disabledTools: %s" % ", ".join(
+                str(t) for t in entry["disabledTools"])
+        if any("${env:" in str(a) for a in (entry.get("args") or [])):
+            note += "; args use ${env:VAR} interpolation (documented)"
+        add_mcp_server(res, name, source, scope, transport, via,
+                       command=command,
+                       args=entry.get("args") if command else None,
+                       url=url, env=entry.get("env"),
+                       headers=entry.get("headers"), note=note)
+
+
+def _roo_global_candidates():
+    """Candidate on-disk paths for Roo Code's global mcp_settings.json.
+
+    [documented-vs-source] the filename (GlobalFileNames.mcpSettings at
+    RooCodeInc/Roo-Code@main) and that it lives in the extension's
+    settings directory (VS Code globalStorage); [inferred] the exact
+    directory layout, from VS Code globalStorage conventions. Coverage
+    is reported per run — partial answers are never presented complete.
+    """
+    h = home()
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", "")
+        gs = [os.path.join(base, "Code", "User", "globalStorage")] if base else []
+    elif sys.platform == "darwin":
+        gs = [os.path.join(h, "Library", "Application Support", "Code",
+                           "User", "globalStorage")]
+    else:
+        gs = [os.path.join(h, ".config", "Code", "User", "globalStorage")]
+    out = []
+    for g in gs:
+        out.append(os.path.join(g, "rooveterinaryinc.roo-cline", "settings",
+                                "mcp_settings.json"))
+        out.append(os.path.join(g, "rooveterinaryinc.roo-cline",
+                                "mcp_settings.json"))
+    return out
+
+
 def resolve_mcp_roo(d):
     res = new_mcp_resolution("roo")
-    res["notes"].append(
-        "[inferred] Roo Code's MCP servers are configured in .roo/mcp.json "
-        "(project scope, per community templates) — the format is not "
-        "officially documented for static resolution, so --mcp is not "
-        "modeled for roo")
+    ad = os.path.abspath(d)
+    # Project scope: <workspace>/.roo/mcp.json — auto-detected at the
+    # workspace root. [documented] (McpHub.getProjectMcpPath joins the
+    # workspace path with ".roo"/"mcp.json").
+    proj = os.path.join(ad, ".roo", "mcp.json")
+    obj = read_json_obj(proj)
+    proj_names = set()
+    if obj is None:
+        if os.path.exists(proj):
+            res["warnings"].append(
+                "%s exists but is unreadable/not JSON" % proj)
+        else:
+            res["notes"].append(
+                "[documented] no .roo/mcp.json under %s; no project-scope "
+                "servers" % ad)
+    else:
+        mcp_from_roo_block(res, obj.get("mcpServers"), proj, "project",
+                           "[documented] .roo/mcp.json = project scope")
+        proj_names = {s["name"] for s in res["servers"]
+                      if s["scope"] == "project"}
+    # Global scope: mcp_settings.json in the extension settings directory.
+    global_read = False
+    for gp in _roo_global_candidates():
+        gobj = read_json_obj(gp)
+        if gobj is None:
+            if os.path.exists(gp):
+                res["warnings"].append(
+                    "%s exists but is unreadable/not JSON" % gp)
+            continue
+        global_read = True
+        mcp_from_roo_block(res, gobj.get("mcpServers"), gp, "global",
+                           "[inferred] mcp_settings.json = global scope")
+        # [documented] precedence: a server name present in both scopes is
+        # defined by the project file; the global entry is dropped, loudly.
+        for dup in sorted(proj_names & {s["name"] for s in res["servers"]
+                                        if s["scope"] == "global"}):
+            res["servers"] = [s for s in res["servers"]
+                              if not (s["name"] == dup and s["scope"] == "global")]
+            res["notes"].append(
+                "[documented] server %r defined in both scopes: project "
+                ".roo/mcp.json takes precedence; the global entry is "
+                "dropped" % dup)
+        break
+    if not global_read:
+        res["notes"].append(
+            "[inferred] no global mcp_settings.json found in the checked "
+            "globalStorage candidates (%d path(s)); global-scope servers "
+            "(if any) are not shown" % len(_roo_global_candidates()))
     return res
 
 

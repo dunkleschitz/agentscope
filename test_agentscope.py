@@ -293,7 +293,7 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.9.0", r.stdout)
+        self.assertIn("1.10.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
             "antigravity", "cline", "roo"):
@@ -851,7 +851,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.9.0")
+        self.assertEqual(body["version"], "1.10.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",
@@ -1938,7 +1938,6 @@ class RooTests(Base):
     def test_other_modes_empty_with_honest_note(self):
         root, home = self.tree({".roo/rules/a.md": "# a\n"})
         expected = {
-            "--mcp": "so --mcp is not modeled for roo",
             "--hooks": "no documented hook mechanism found for Roo Code",
             "--permissions": "so --permissions is not modeled for roo",
             "--skills": "no documented Agent Skills directory found for Roo",
@@ -1947,6 +1946,12 @@ class RooTests(Base):
             r = self.tool(home, mode, "--harness", "roo", root)
             self.assertEqual(r.returncode, 1)
             self.assertIn(fragment, r.stdout)
+        # --mcp IS modeled for roo since v1.10.0: with no configs it is
+        # honestly empty, with coverage notes for each source checked.
+        r = self.tool(home, "--mcp", "--harness", "roo", root)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no .roo/mcp.json", r.stdout)
+        self.assertIn("no global mcp_settings.json found", r.stdout)
 
     def test_tag_vocabulary(self):
         root, home = self.tree({
@@ -1964,3 +1969,136 @@ class RooTests(Base):
                                 "[inferred]" in c["via"], c["path"])
             for w in h["warnings"] + h["notes"]:
                 self.assertTrue("[documented]" in w or "[inferred]" in w, w)
+
+
+class RooMcpTests(Base):
+    GLOBAL_REL = os.path.join(
+        ".config", "Code", "User", "globalStorage",
+        "rooveterinaryinc.roo-cline", "settings", "mcp_settings.json")
+
+    def _global(self, home, struct):
+        for rel, content in struct.items():
+            p = os.path.join(home, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+
+    def _mcp(self, home, root):
+        r = self.tool(home, "--mcp", "--harness", "roo", "--json", root)
+        return r, json.loads(r.stdout)["harnesses"][0]
+
+    def test_project_and_global_merge_with_precedence(self):
+        root, home = self.tree({
+            ".roo/mcp.json": json.dumps({"mcpServers": {
+                "gh": {"command": "npx", "args": ["-y", "gh-mcp"],
+                       "env": {"GH_TOKEN": "x"}},
+                "web": {"type": "streamable-http",
+                        "url": "https://m.example.com/mcp?k=secret#frag",
+                        "headers": {"Authorization": "Bearer x"}}}}),
+        })
+        self._global(home, {self.GLOBAL_REL: json.dumps({"mcpServers": {
+            "gh": {"command": "/other/gh-mcp"},
+            "legacy": {"type": "sse", "url": "https://legacy.example/sse"},
+            "off": {"command": "npx", "disabled": True}}})})
+        r, h = self._mcp(home, root)
+        self.assertEqual(r.returncode, 0)
+        by_name = {s["name"]: s for s in h["servers"]}
+        # Project entry wins over the same-name global one.
+        self.assertEqual(by_name["gh"]["scope"], "project")
+        self.assertEqual(by_name["gh"]["command"], "npx")
+        self.assertTrue(any("takes precedence" in n and "'gh'" in n
+                            for n in h["notes"]))
+        # Remote types are reported as http with the exact type in the note;
+        # secret values are never printed.
+        self.assertEqual(by_name["web"]["transport"], "http")
+        self.assertIn("type: streamable-http", by_name["web"]["note"])
+        self.assertEqual(by_name["web"]["url"], "https://m.example.com/mcp")
+        self.assertEqual(by_name["web"]["headers"], {"Authorization": "<set>"})
+        self.assertEqual(by_name["gh"]["env"], {"GH_TOKEN": "<set>"})
+        self.assertIn("type: sse", by_name["legacy"]["note"])
+        self.assertIn("DISABLED", by_name["off"]["note"])
+        self.assertNotIn("Bearer x", r.stdout)
+        self.assertNotIn("?k=secret", r.stdout)  # query stripped from URL
+        self.assertNotIn("#frag", r.stdout)     # fragment stripped
+
+    def test_validation_warnings(self):
+        root, home = self.tree({
+            ".roo/mcp.json": json.dumps({"mcpServers": {
+                "mixed": {"command": "npx",
+                          "url": "https://x.example/mcp",
+                          "type": "streamable-http"},
+                "typeless": {"url": "https://x.example/mcp"},
+                "empty": {},
+                "bogus": {"command": "npx", "type": "grpc"},
+                "cmdless": {"type": "stdio"}}})})
+        r, h = self._mcp(home, root)
+        self.assertEqual(h["servers"], [])
+        self.assertEqual(r.returncode, 1)
+        joined = "\n".join(h["warnings"])
+        self.assertIn("'mixed'", joined)
+        self.assertIn("'typeless'", joined)
+        self.assertIn("'empty'", joined)
+        self.assertIn("'bogus'", joined)
+        self.assertIn("'cmdless'", joined)
+
+    def test_env_var_interpolation_note(self):
+        # ${env:VAR} in args is Roo Code's documented way of KEEPING
+        # secrets out of the config: the variable NAME is public config
+        # text (shown verbatim, like env key names), the VALUE is never
+        # resolved or printed. This test asserts that distinction.
+        root, home = self.tree({
+            ".roo/mcp.json": json.dumps({"mcpServers": {
+                "dockerized": {"command": "docker",
+                               "args": ["-e", "TOK=${env:MY_TOKEN}",
+                                        "img"]}}})})
+        os.environ["MY_TOKEN"] = "actual-secret-value-xyz"
+        try:
+            r, h = self._mcp(home, root)
+        finally:
+            del os.environ["MY_TOKEN"]
+        self.assertEqual(r.returncode, 0)
+        srv = h["servers"][0]
+        self.assertIn("${env:VAR} interpolation", srv["note"])
+        self.assertIn("${env:MY_TOKEN}", r.stdout)  # name visible, intended
+        self.assertNotIn("actual-secret-value-xyz", r.stdout)  # value never
+
+    def test_always_allow_and_disabled_tools(self):
+        root, home = self.tree({
+            ".roo/mcp.json": json.dumps({"mcpServers": {
+                "fs": {"command": "fs-mcp",
+                       "alwaysAllow": ["read_file"],
+                       "disabledTools": ["write_file"]}}})})
+        r, h = self._mcp(home, root)
+        self.assertEqual(r.returncode, 0)
+        note = h["servers"][0]["note"]
+        self.assertIn("alwaysAllow: read_file", note)
+        self.assertIn("disabledTools: write_file", note)
+
+    def test_no_configs(self):
+        root, home = self.tree({})
+        r, h = self._mcp(home, root)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(h["servers"], [])
+        self.assertTrue(any("no .roo/mcp.json" in n for n in h["notes"]))
+        self.assertTrue(any("no global mcp_settings.json found" in n
+                            for n in h["notes"]))
+
+    def test_unreadable_project_config(self):
+        root, home = self.tree({".roo/mcp.json": "{not json"})
+        r, h = self._mcp(home, root)
+        self.assertEqual(r.returncode, 1)
+        self.assertTrue(any("unreadable/not JSON" in w for w in h["warnings"]))
+
+    def test_tag_vocabulary(self):
+        root, home = self.tree({
+            ".roo/mcp.json": json.dumps({"mcpServers": {
+                "gh": {"command": "npx"}}})})
+        self._global(home, {self.GLOBAL_REL: json.dumps({"mcpServers": {
+            "gh": {"command": "other"}}})})
+        _, h = self._mcp(home, root)
+        for s in h["servers"]:
+            self.assertTrue("[documented]" in s["via"] or
+                            "[inferred]" in s["via"], s["via"])
+        for w in h["warnings"] + h["notes"]:
+            self.assertTrue("[documented]" in w or "[inferred]" in w or
+                            "documented-vs-source" in w, w)

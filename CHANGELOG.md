@@ -1,5 +1,32 @@
 # CHANGELOG — agentscope
 
+## 1.11.0 (2026-10-23)
+
+Tenth harness: `--harness aider` — "which files will aider always load
+read-only for directory Y?" Aider has no automatic instruction
+discovery: the answer is the effective `read:` list from
+`.aider.conf.yml`. Chain loads `~/.aider.conf.yml` → `<git-root>/
+.aider.conf.yml` → `<cwd>/.aider.conf.yml` (identical resolved paths
+deduped, first occurrence kept — both from aider's own
+`generate_search_path_list` in `main.py`). `--read` is an argparse
+`append` action (verified in `args.py`), so per-file lists concatenate
+in load order; CLI `--read` flags would append after. Entries resolve as
+`Path(fn).expanduser().resolve()` — relative to aider's working
+directory (agentscope resolves against DIR) with `~` expansion;
+directories are rglob'd by aider at runtime (noted, not enumerated).
+`read:` parsing is minimal-dependency YAML-subset (block sequences,
+flow lists, single scalars, `#` comments only after whitespace).
+`--config <file>` (replaces the chain) and CLI flags are invisible to a
+static resolver — disclosed, never claimed. A CONVENTIONS.md not
+referenced by `read:` loads nothing, stated plainly. `--mcp`/`--hooks`/
+`--permissions`/`--skills` are honestly empty with notes. 9 new
+hermetic tests (170 total; two real bugs caught during the build: a
+comment-stripper that would corrupt filenames containing `#`, and —
+during source verification — the last-wins merge assumption, which
+aider's `append` semantics proved wrong: lists concatenate). Dogfood
+doccover + clicheck clean. This also corrected the old ROADMAP aider
+note, which had the load order backwards.
+
 ## 1.10.0 (2026-10-23)
 
 Tenth harness `--mcp` model: `--harness roo` — "which MCP servers will

@@ -293,7 +293,7 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.10.0", r.stdout)
+        self.assertIn("1.11.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
             "antigravity", "cline", "roo"):
@@ -851,7 +851,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.10.0")
+        self.assertEqual(body["version"], "1.11.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",
@@ -2102,3 +2102,124 @@ class RooMcpTests(Base):
         for w in h["warnings"] + h["notes"]:
             self.assertTrue("[documented]" in w or "[inferred]" in w or
                             "documented-vs-source" in w, w)
+
+
+class AiderTests(Base):
+    def _global(self, home, struct):
+        for rel, content in struct.items():
+            p = os.path.join(home, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+
+    def _harness(self, home, *args):
+        r = self.tool(home, "--harness", "aider", "--json", *args)
+        return r, json.loads(r.stdout)["harnesses"][0]
+
+    def test_three_layer_concatenation_in_load_order(self):
+        # aider's --read is an argparse append action: read: lists from the
+        # three config files CONCATENATE in load order (home -> git root ->
+        # cwd), verified vs aider/main.py generate_search_path_list.
+        root, home = self.tree({
+            ".git": None,
+            ".aider.conf.yml": "read: [root.md]\n",
+            "root.md": "# root\n",
+        })
+        self._global(home, {
+            ".aider.conf.yml": "read: [%s]\n" % os.path.join(home, "home.md"),
+            "home.md": "# home\n",
+        })
+        r, h = self._harness(home, root)
+        self.assertEqual(r.returncode, 0)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [os.path.join(home, "home.md"),
+                                 os.path.join(root, "root.md")])
+        self.assertTrue(any("concatenation" in n and "home -> git root -> cwd" in n
+                            for n in h["notes"]))
+
+    def test_relative_entries_resolve_against_cwd(self):
+        # aider resolves read: entries as Path(fn).expanduser().resolve() —
+        # relative to its working directory, NOT the config file's dir
+        # (verified vs aider/main.py). A home-config relative entry that is
+        # absent under DIR is honestly reported missing.
+        root, home = self.tree({})
+        self._global(home, {".aider.conf.yml": "read: [ghost.md]\n"})
+        r, h = self._harness(home, root)
+        self.assertTrue(any("ghost.md" in w and "not found on disk" in w
+                            for w in h["warnings"]))
+        self.assertTrue(any("ghost.md" in w and "cwd" in w
+                            for w in h["warnings"]))
+
+    def test_cwd_config_bracket_form(self):
+        root, home = self.tree({
+            ".git": None,
+            ".aider.conf.yml": "read: [root.md]\n",
+            "root.md": "# root\n",
+            "sub": None,
+            "sub/.aider.conf.yml": "read: [local.md]  # project rules\n",
+            "sub/local.md": "# local\n",
+        })
+        r, h = self._harness(home, os.path.join(root, "sub"))
+        paths = [c["path"] for c in h["contributors"]]
+        # local.md resolves (cwd); root.md from the git-root config does
+        # not exist under sub/ -> warning, per aider's cwd resolution.
+        self.assertIn(os.path.join(root, "sub", "local.md"), paths)
+        self.assertTrue(any("root.md" in w and "not found on disk" in w
+                            for w in h["warnings"]))
+
+    def test_scalar_and_quoted_hash_forms(self):
+        root, home = self.tree({
+            ".aider.conf.yml": 'read: "file#1.md"\n',
+            "file#1.md": "# x\n",
+        })
+        r, h = self._harness(home, root)
+        self.assertEqual(r.returncode, 0)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertTrue(any(p.endswith("file#1.md") for p in paths),
+                        paths)
+
+    def test_missing_read_file_warns(self):
+        root, home = self.tree({
+            ".aider.conf.yml": "read:\n  - ghost.md\n",
+        })
+        r, h = self._harness(home, root)
+        self.assertTrue(any("ghost.md" in w and "not found on disk" in w
+                            for w in h["warnings"]))
+
+    def test_no_config_at_all(self):
+        root, home = self.tree({})
+        r, h = self._harness(home, root)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(h["contributors"], [])
+        self.assertTrue(any("no .aider.conf.yml" in n for n in h["notes"]))
+
+    def test_other_modes_honestly_empty(self):
+        root, home = self.tree({".aider.conf.yml": "read: [a.md]\n",
+                                "a.md": "# a\n"})
+        expected = {
+            "--mcp": "no MCP server",
+            "--hooks": "no documented lifecycle hook",
+            "--permissions": "no documented static allow/deny",
+            "--skills": "no documented Agent Skills directory",
+        }
+        for mode, fragment in expected.items():
+            r = self.tool(home, mode, "--harness", "aider", root)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn(fragment, r.stdout)
+
+    def test_tag_vocabulary(self):
+        root, home = self.tree({
+            ".aider.conf.yml": "read:\n  - a.md\n",
+            "a.md": "# a\n",
+        })
+        _, h = self._harness(home, root)
+        for c in h["contributors"]:
+            self.assertTrue("[documented]" in c["via"] or
+                            "[inferred]" in c["via"], c["via"])
+        for w in h["warnings"] + h["notes"]:
+            self.assertTrue("[documented]" in w or "[inferred]" in w, w)
+
+    def test_harness_listed(self):
+        root, home = self.tree({})
+        r = self.tool(home, "--list-harnesses")
+        self.assertIn("aider", r.stdout)

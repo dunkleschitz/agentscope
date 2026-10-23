@@ -54,7 +54,7 @@ import os
 import re
 import sys
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 RULES_VERIFIED = "2026-10-23"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -71,7 +71,7 @@ CODEX_CAP_DEFAULT = 32 * 1024  # [documented] project_doc_max_bytes default
 CLAUDE_IMPORT_HOPS = 4        # [documented] per Claude Code memory docs (via guides)
 
 HARNESSES = ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
-             "antigravity", "cline", "roo")
+             "antigravity", "cline", "roo", "aider")
 ALIASES = {"claude-code": "claude"}
 
 
@@ -1468,11 +1468,166 @@ def resolve_roo(d, roo_mode=None):
     return res
 
 
+def _strip_yaml_comment(line):
+    # YAML: '#' starts a comment only at line start or after whitespace.
+    if line.lstrip().startswith("#"):
+        return ""
+    return re.sub(r"\s+#.*$", "", line)
+
+
+def _aider_read_list(text):
+    """Extract the `read:` file list from a .aider.conf.yml text.
+
+    Handles the three documented forms: `read: [a, b]`, `read: single`,
+    and a bulleted list under a bare `read:`. This is a deliberately
+    minimal parser for ONE key — anything fancier (anchors, multi-line
+    flow scalars, nested maps under read:) is reported, not guessed.
+    Returns (items, warnings); items are raw strings as written.
+    """
+    items = []
+    warnings = []
+    lines = text.splitlines()
+    i = 0
+    found = False
+    while i < len(lines):
+        line = lines[i]
+        stripped = _strip_yaml_comment(line)
+        m = re.match(r"^read\s*:(.*)$", stripped)
+        if not m or line[:1] in (" ", "\t"):
+            i += 1
+            continue
+        found = True
+        rest = m.group(1).strip()
+        if rest.startswith("["):
+            if not rest.endswith("]"):
+                warnings.append(
+                    "read: bracket list spans multiple lines or is "
+                    "unterminated; skipped (not guessed)")
+            else:
+                for part in rest[1:-1].split(","):
+                    part = part.strip().strip("'\"")
+                    if part:
+                        items.append(part)
+            i += 1
+            continue
+        if rest:
+            items.append(rest.strip().strip("'\""))
+            i += 1
+            continue
+        # bulleted list on following lines
+        i += 1
+        while i < len(lines):
+            bl = lines[i]
+            if not bl.strip() or bl.lstrip().startswith("#"):
+                i += 1
+                continue
+            bm = re.match(r"^[ \t]+-\s+(.*)$", bl)
+            if not bm:
+                break
+            val = _strip_yaml_comment(bm.group(1)).strip().strip("'\"")
+            if val:
+                items.append(val)
+            i += 1
+        continue
+    if not found:
+        warnings.append("no top-level `read:` key found")
+    return items, warnings
+
+
+def resolve_aider(d):
+    """Aider: the effective `read:` list — configured, not discovered.
+
+    Verified 2026-10-23 vs aider's own source (Aider-AI/aider@main):
+      - aider/main.py `generate_search_path_list`: config files load in
+        order home dir -> git repo root -> current directory (-> --config
+        file); `--read` is an argparse `append` action, so `read:` lists
+        CONCATENATE in that order (then CLI --read flags).
+      - aider/main.py: read entries resolve as
+        `Path(fn).expanduser().resolve()` — i.e. relative to aider's
+        working directory, with ~ expansion; directories are rglob'd.
+    agentscope resolves relative entries against DIR (the directory you
+    ask about = where aider would run) and mirrors the concatenation.
+    """
+    res = new_resolution("aider")
+    h = home()
+    ad = os.path.abspath(d)
+    root = git_root(ad)
+    chain = [(os.path.join(h, ".aider.conf.yml"), "home")]
+    if root:
+        chain.append((os.path.join(root, ".aider.conf.yml"), "git-root"))
+    chain.append((os.path.join(ad, ".aider.conf.yml"), "cwd"))
+    # aider's generate_search_path_list dedups identical resolved paths
+    # (e.g. when git root == cwd), keeping the first occurrence.
+    seen, deduped = set(), []
+    for path, scope in chain:
+        rp = os.path.normpath(path)
+        if rp not in seen:
+            seen.add(rp)
+            deduped.append((path, scope))
+    chain = deduped
+    read_lists = []  # (scope, path, items) in load order
+    for path, scope in chain:
+        data = read_bytes(path)
+        if data is None:
+            res["notes"].append(
+                "[documented] no .aider.conf.yml at %s scope (%s)"
+                % (scope, path))
+            continue
+        try:
+            text = data.decode("utf-8", "replace")
+        except Exception:
+            text = ""
+        items, warns = _aider_read_list(text)
+        for w in warns:
+            res["warnings"].append("%s: %s" % (path, w))
+        read_lists.append((scope, path, items))
+    # Effective list: concatenation in load order (configargparse append
+    # semantics), CLI --read flags would come after (invisible statically).
+    for scope, path, items in read_lists:
+        for item in items:
+            expanded = os.path.expanduser(item)
+            cand = expanded if os.path.isabs(expanded) else os.path.join(
+                ad, expanded)
+            via = ("[documented] `read:` in %s .aider.conf.yml (%s); "
+                   "[documented] aider resolves entries as "
+                   "Path(fn).expanduser().resolve() — relative to its "
+                   "working directory; agentscope resolves against DIR"
+                   % (scope, path))
+            if os.path.isdir(cand):
+                res["notes"].append(
+                    "%s lists directory %r in `read:` — aider rglobs it "
+                    "recursively at runtime; not enumerated statically"
+                    % (path, item))
+                continue
+            c = add_file(res, cand, "config-read", via)
+            if c is None:
+                res["warnings"].append(
+                    "%s lists %r in `read:` but it was not found on disk "
+                    "(aider would resolve it against its own cwd at "
+                    "runtime)" % (path, item))
+    if read_lists:
+        eff = [i for _, _, items in read_lists for i in items]
+        res["notes"].append(
+            "[documented] effective `read:` list = concatenation "
+            "in config load order (home -> git root -> cwd): %s"
+            % (", ".join(eff) if eff else "(empty)"))
+        res["notes"].append(
+            "[documented] CLI `--read` flags append after the config lists "
+            "and `--config <file>` replaces the whole chain — both are "
+            "invisible to a static resolver and are never claimed.")
+    res["notes"].append(
+        "[documented] aider has no automatic instruction discovery: files "
+        "count as loaded context only via `read:` (or --read / /read at "
+        "runtime). A CONVENTIONS.md that is not referenced loads nothing.")
+    return res
+
+
 INSTR_RESOLVERS = {"codex": resolve_codex, "claude": resolve_claude,
                    "cursor": resolve_cursor, "copilot": resolve_copilot,
                    "gemini": resolve_gemini, "opencode": resolve_opencode,
                    "antigravity": resolve_antigravity,
-                   "cline": resolve_cline, "roo": resolve_roo}
+                   "cline": resolve_cline, "roo": resolve_roo,
+                   "aider": resolve_aider}
 
 
 # --------------------------------------------------------------------------
@@ -1938,7 +2093,7 @@ def mcp_from_roo_block(res, block, source, scope, via):
 def _roo_global_candidates():
     """Candidate on-disk paths for Roo Code's global mcp_settings.json.
 
-    [documented-vs-source] the filename (GlobalFileNames.mcpSettings at
+    [documented] the filename (GlobalFileNames.mcpSettings at
     RooCodeInc/Roo-Code@main) and that it lives in the extension's
     settings directory (VS Code globalStorage); [inferred] the exact
     directory layout, from VS Code globalStorage conventions. Coverage
@@ -1960,6 +2115,14 @@ def _roo_global_candidates():
         out.append(os.path.join(g, "rooveterinaryinc.roo-cline",
                                 "mcp_settings.json"))
     return out
+
+
+def resolve_mcp_aider(d):
+    res = new_mcp_resolution("aider")
+    res["notes"].append(
+        "[inferred] aider talks to model APIs directly — no MCP server "
+        "mechanism, so --mcp is not modeled for aider")
+    return res
 
 
 def resolve_mcp_roo(d):
@@ -2019,7 +2182,8 @@ MCP_RESOLVERS = {"codex": resolve_mcp_codex, "claude": resolve_mcp_claude,
                  "cursor": resolve_mcp_cursor, "copilot": resolve_mcp_copilot,
                  "gemini": resolve_mcp_gemini, "opencode": resolve_mcp_opencode,
                  "antigravity": resolve_mcp_antigravity,
-                 "cline": resolve_mcp_cline, "roo": resolve_mcp_roo}
+                 "cline": resolve_mcp_cline, "roo": resolve_mcp_roo,
+                 "aider": resolve_mcp_aider}
 RESOLVERS = {"instructions": INSTR_RESOLVERS, "mcp": MCP_RESOLVERS}
 
 
@@ -2568,6 +2732,14 @@ def resolve_hooks_cline(d):
     return res
 
 
+def resolve_hooks_aider(d):
+    res = new_hook_resolution("aider")
+    res["notes"].append(
+        "[inferred] aider has no documented lifecycle hook mechanism "
+        "(lint/test commands run post-edit but are not hooks) — not modeled")
+    return res
+
+
 def resolve_hooks_roo(d):
     res = new_hook_resolution("roo")
     res["notes"].append(
@@ -2582,7 +2754,8 @@ HOOK_RESOLVERS = {"codex": resolve_hooks_codex, "claude": resolve_hooks_claude,
                   "gemini": resolve_hooks_gemini,
                   "opencode": resolve_hooks_opencode,
                   "antigravity": resolve_hooks_antigravity,
-                  "cline": resolve_hooks_cline, "roo": resolve_hooks_roo}
+                  "cline": resolve_hooks_cline, "roo": resolve_hooks_roo,
+                  "aider": resolve_hooks_aider}
 RESOLVERS["hooks"] = HOOK_RESOLVERS
 
 # --------------------------------------------------------------------------
@@ -2825,6 +2998,14 @@ def resolve_permissions_cline(d):
     return res
 
 
+def resolve_permissions_aider(d):
+    res = new_perm_resolution("aider")
+    res["notes"].append(
+        "[inferred] aider has no documented static allow/deny rule format — "
+        "not modeled")
+    return res
+
+
 def resolve_permissions_roo(d):
     res = new_perm_resolution("roo")
     res["notes"].append(
@@ -2843,7 +3024,8 @@ PERM_RESOLVERS = {"codex": resolve_permissions_codex,
                   "opencode": resolve_permissions_opencode,
                   "antigravity": resolve_permissions_antigravity,
                   "cline": resolve_permissions_cline,
-                  "roo": resolve_permissions_roo}
+                  "roo": resolve_permissions_roo,
+                  "aider": resolve_permissions_aider}
 RESOLVERS["permissions"] = PERM_RESOLVERS
 
 
@@ -3226,6 +3408,14 @@ def resolve_skills_cline(d):
     return res
 
 
+def resolve_skills_aider(d):
+    res = new_skill_resolution("aider")
+    res["notes"].append(
+        "[inferred] no documented Agent Skills directory found for aider — "
+        "not modeled")
+    return res
+
+
 def resolve_skills_roo(d):
     res = new_skill_resolution("roo")
     res["notes"].append(
@@ -3242,7 +3432,8 @@ SKILLS_RESOLVERS = {"codex": resolve_skills_codex,
                     "opencode": resolve_skills_opencode,
                     "antigravity": resolve_skills_antigravity,
                     "cline": resolve_skills_cline,
-                    "roo": resolve_skills_roo}
+                    "roo": resolve_skills_roo,
+                    "aider": resolve_skills_aider}
 RESOLVERS["skills"] = SKILLS_RESOLVERS
 
 

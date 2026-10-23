@@ -54,7 +54,7 @@ import os
 import re
 import sys
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 RULES_VERIFIED = "2026-10-23"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -71,7 +71,7 @@ CODEX_CAP_DEFAULT = 32 * 1024  # [documented] project_doc_max_bytes default
 CLAUDE_IMPORT_HOPS = 4        # [documented] per Claude Code memory docs (via guides)
 
 HARNESSES = ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
-             "antigravity")
+             "antigravity", "cline")
 ALIASES = {"claude-code": "claude"}
 
 
@@ -1133,10 +1133,198 @@ def resolve_permissions_antigravity(d):
     return res
 
 
+# --------------------------------------------------------------------------
+# Cline (v1.8.0) — instructions mode.
+# Verified 2026-10-23 vs docs.cline.bot/customization/cline-rules (official;
+# page updated 2026-10-07).
+# --------------------------------------------------------------------------
+
+def _cline_project_root(d):
+    """Nearest ancestor of d holding workspace rule markers, else d.
+
+    Workspace rules live at the project (workspace) root [documented]; when
+    DIR is a subdirectory the upward walk finds that root [inferred]. The
+    walk never ascends past $HOME, so a stray ~/AGENTS.md is never treated
+    as workspace scope (Cline's workspace AGENTS.md is project-root only;
+    the global one is ~/.agents/AGENTS.md).
+    """
+    d = os.path.abspath(d)
+    h = os.path.abspath(home())
+    markers = (".clinerules", os.path.join(".cline", "rules"),
+               ".cursorrules", ".windsurfrules", "AGENTS.md")
+    cur = d
+    while True:
+        for marker in markers:
+            if os.path.exists(os.path.join(cur, marker)):
+                return cur
+        parent = os.path.dirname(cur)
+        if parent == cur or cur == h:
+            return d
+        cur = parent
+
+
+def _cline_paths(text):
+    """Classify a Cline rule file's conditional frontmatter.
+
+    Returns ("always",) | ("never",) | ("conditional", raw) | ("unknown",).
+    Only the documented `paths` conditional is recognized. Regex parse of
+    the frontmatter block only — YAML is never evaluated, nothing executed.
+    """
+    if not text.startswith("---"):
+        return ("always",)
+    end = text.find("\n---", 3)
+    if end == -1:
+        return ("always",)
+    head = text[3:end]
+    # NOTE: [ \t]*, not \s*, around the value — \s would swallow the
+    # newline and merge a multi-line list into the single-line branch.
+    m = re.search(r"(?m)^\s*paths\s*:[ \t]*(.*?)[ \t]*$", head)
+    if not m:
+        return ("always",)
+    val = m.group(1)
+    if val == "":
+        items = []
+        for line in head[m.end():].splitlines():
+            lm = re.match(r"^\s*-\s*(.+?)\s*$", line)
+            if lm:
+                items.append(lm.group(1))
+            elif line.strip() == "" or re.match(r"^\s*#", line):
+                continue
+            else:
+                break
+        if items:
+            return ("conditional", "[%s]" % ", ".join(items))
+        return ("unknown",)
+    v = val.strip().strip("\"'")
+    if v == "[]":
+        return ("never",)
+    return ("conditional", v)
+
+
+def _cline_add_rule_file(res, path):
+    data = non_empty(path)
+    if not data:
+        return
+    text = data.decode("utf-8", "replace")
+    kind = _cline_paths(text)
+    if kind[0] == "never":
+        via = ("[documented] conditional rule with empty paths: [] — the "
+               "harness never activates it")
+    elif kind[0] == "conditional":
+        via = ("[documented] conditional rule (paths=%s): activates "
+               "dynamically when the current context (open tabs, mentioned "
+               "paths, edited files) matches — reported structurally, "
+               "activation never predicted" % kind[1])
+    elif kind[0] == "unknown":
+        via = ("[documented] conditional frontmatter present but the paths "
+               "value form was not parsed — activation dynamic, not "
+               "predicted")
+    else:
+        via = ("[documented] workspace rule file, always active (no "
+               "conditional frontmatter)")
+    add_file(res, path, "project-rule", via)
+
+
+def resolve_cline(d):
+    """Cline instruction resolution.
+
+    Verified 2026-10-23 vs docs.cline.bot/customization/cline-rules.
+    Scopes (documented):
+      - global: ~/Documents/Cline/Rules/*.md (macOS/Linux/WSL; Windows is
+        Documents\\Cline\\Rules) plus ~/.agents/AGENTS.md — loaded first,
+        the baseline;
+      - workspace: .clinerules/ and .cline/rules/ at the project root
+        (both searched when present, .md and .txt files processed,
+        combined), plus auto-detected .cursorrules, .windsurfrules and
+        AGENTS.md at the project root.
+    Merge (documented): global + workspace combined; workspace rules take
+    precedence on conflict. The relative order of the workspace formats
+    (.clinerules/ vs .cursorrules vs .windsurfrules vs AGENTS.md) is
+    undocumented — the order below is [inferred].
+    Conditional rules (documented): a YAML frontmatter `paths` conditional
+    scopes a rule to matching files; activation depends on the live editor
+    context, so it is reported structurally and never predicted.
+    Rule toggles are UI state in the Rules panel, not files — not modeled;
+    a toggled-off rule still appears here. Multi-root workspaces: the
+    .clinerules/ dir only works in the primary workspace folder.
+    Strictly read-only.
+    """
+    res = new_resolution("cline")
+    h = home()
+    root = _cline_project_root(d)
+    # 1. global scope — the documented baseline
+    try:
+        gnames = sorted(os.listdir(os.path.join(h, "Documents", "Cline",
+                                                "Rules")))
+    except OSError:
+        gnames = []
+    for n in gnames:
+        if n.endswith(".md"):
+            p = os.path.join(h, "Documents", "Cline", "Rules", n)
+            if non_empty(p):
+                add_file(res, p, "global",
+                         "[documented] global rule "
+                         "(~/Documents/Cline/Rules); loaded first, baseline")
+    gp = os.path.join(h, ".agents", "AGENTS.md")
+    if non_empty(gp):
+        add_file(res, gp, "global",
+                 "[documented] cross-tool global AGENTS.md "
+                 "(~/.agents/AGENTS.md)")
+    # 2. workspace scope — native dirs first, then auto-detected formats
+    for rd in (os.path.join(root, ".clinerules"),
+               os.path.join(root, ".cline", "rules")):
+        try:
+            names = sorted(os.listdir(rd))
+        except OSError:
+            continue
+        for n in names:
+            if n.endswith(".md") or n.endswith(".txt"):
+                _cline_add_rule_file(res, os.path.join(rd, n))
+    for name in (".cursorrules", ".windsurfrules"):
+        p = os.path.join(root, name)
+        if non_empty(p):
+            add_file(res, p, "project-rule",
+                     "[documented] %s auto-detected by Cline (cross-tool "
+                     "compat)" % name)
+    ap = os.path.join(root, "AGENTS.md")
+    if non_empty(ap):
+        add_file(res, ap, "project",
+                 "[documented] AGENTS.md auto-detected by Cline "
+                 "(cross-tool compat)")
+    if root != os.path.abspath(d):
+        res["notes"].append(
+            "[inferred] DIR is a subdirectory; workspace rules were taken "
+            "from the nearest ancestor holding rule markers (%s) — the "
+            "docs define workspace rules at the project (workspace) root"
+            % root)
+    res["notes"].append(
+        "[documented] merge: global + workspace rules are combined; "
+        "workspace rules take precedence on conflict. The relative order "
+        "of the workspace formats above is undocumented [inferred].")
+    res["notes"].append(
+        "[documented] conditional rules activate on live editor context "
+        "(message paths, open/visible tabs, edited files) — dynamic, "
+        "never predicted here.")
+    res["notes"].append(
+        "[documented] every rule has a toggle in the Rules panel (UI "
+        "state, not files): agentscope assumes all discovered rules are "
+        "enabled — a toggled-off rule still appears above.")
+    res["notes"].append(
+        "[documented] multi-root workspaces: .clinerules/ only works in "
+        "the primary workspace folder; rules in other folders are "
+        "ignored by the harness.")
+    res["notes"].append(
+        "[documented] Windows global rules dir is Documents\\Cline\\Rules; "
+        "this resolver models the macOS/Linux/WSL location "
+        "(~/Documents/Cline/Rules).")
+    return res
+
+
 INSTR_RESOLVERS = {"codex": resolve_codex, "claude": resolve_claude,
                    "cursor": resolve_cursor, "copilot": resolve_copilot,
                    "gemini": resolve_gemini, "opencode": resolve_opencode,
-                   "antigravity": resolve_antigravity}
+                   "antigravity": resolve_antigravity,
+                   "cline": resolve_cline}
 
 
 # --------------------------------------------------------------------------
@@ -1518,10 +1706,20 @@ def resolve_mcp_opencode(d):
     return res
 
 
+def resolve_mcp_cline(d):
+    res = new_mcp_resolution("cline")
+    res["notes"].append(
+        "[inferred] Cline's MCP servers are configured in the extension "
+        "settings (cline_mcp_settings.json in VS Code globalStorage), not "
+        "per-directory — no per-directory effective set to resolve")
+    return res
+
+
 MCP_RESOLVERS = {"codex": resolve_mcp_codex, "claude": resolve_mcp_claude,
                  "cursor": resolve_mcp_cursor, "copilot": resolve_mcp_copilot,
                  "gemini": resolve_mcp_gemini, "opencode": resolve_mcp_opencode,
-                 "antigravity": resolve_mcp_antigravity}
+                 "antigravity": resolve_mcp_antigravity,
+                 "cline": resolve_mcp_cline}
 RESOLVERS = {"instructions": INSTR_RESOLVERS, "mcp": MCP_RESOLVERS}
 
 
@@ -2062,12 +2260,21 @@ def resolve_hooks_gemini(d):
     return res
 
 
+def resolve_hooks_cline(d):
+    res = new_hook_resolution("cline")
+    res["notes"].append(
+        "[inferred] no documented shell-hook mechanism found for Cline — "
+        "not modeled")
+    return res
+
+
 HOOK_RESOLVERS = {"codex": resolve_hooks_codex, "claude": resolve_hooks_claude,
                   "cursor": resolve_hooks_cursor,
                   "copilot": resolve_hooks_copilot,
                   "gemini": resolve_hooks_gemini,
                   "opencode": resolve_hooks_opencode,
-                  "antigravity": resolve_hooks_antigravity}
+                  "antigravity": resolve_hooks_antigravity,
+                  "cline": resolve_hooks_cline}
 RESOLVERS["hooks"] = HOOK_RESOLVERS
 
 # --------------------------------------------------------------------------
@@ -2302,13 +2509,22 @@ def resolve_permissions_opencode(d):
     return res
 
 
+def resolve_permissions_cline(d):
+    res = new_perm_resolution("cline")
+    res["notes"].append(
+        "[inferred] no documented static allow/deny rule format found for "
+        "Cline — not modeled")
+    return res
+
+
 PERM_RESOLVERS = {"codex": resolve_permissions_codex,
                   "claude": resolve_permissions_claude,
                   "cursor": resolve_permissions_cursor,
                   "copilot": resolve_permissions_copilot,
                   "gemini": resolve_permissions_gemini,
                   "opencode": resolve_permissions_opencode,
-                  "antigravity": resolve_permissions_antigravity}
+                  "antigravity": resolve_permissions_antigravity,
+                  "cline": resolve_permissions_cline}
 RESOLVERS["permissions"] = PERM_RESOLVERS
 
 
@@ -2683,13 +2899,22 @@ def resolve_skills_antigravity(d):
     return res
 
 
+def resolve_skills_cline(d):
+    res = new_skill_resolution("cline")
+    res["notes"].append(
+        "[inferred] no documented Agent Skills directory found for Cline — "
+        "not modeled")
+    return res
+
+
 SKILLS_RESOLVERS = {"codex": resolve_skills_codex,
                     "claude": resolve_skills_claude,
                     "cursor": resolve_skills_cursor,
                     "copilot": resolve_skills_copilot,
                     "gemini": resolve_skills_gemini,
                     "opencode": resolve_skills_opencode,
-                    "antigravity": resolve_skills_antigravity}
+                    "antigravity": resolve_skills_antigravity,
+                    "cline": resolve_skills_cline}
 RESOLVERS["skills"] = SKILLS_RESOLVERS
 
 

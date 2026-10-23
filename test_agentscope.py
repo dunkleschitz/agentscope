@@ -293,7 +293,7 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.7.0", r.stdout)
+        self.assertIn("1.8.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode",
             "antigravity"):
@@ -851,7 +851,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.7.0")
+        self.assertEqual(body["version"], "1.8.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",
@@ -1642,3 +1642,159 @@ class SkillsTests(Base):
         r = self.tool(home, "--skills", "--mcp", root)
         self.assertEqual(r.returncode, 2)
         self.assertIn("mutually exclusive", r.stderr)
+
+
+class ClineTests(Base):
+    def _global(self, home):
+        d = os.path.join(home, "Documents", "Cline", "Rules")
+        os.makedirs(d)
+        with open(os.path.join(d, "g.md"), "w") as f:
+            f.write("# global\n")
+        a = os.path.join(home, ".agents")
+        os.makedirs(a)
+        with open(os.path.join(a, "AGENTS.md"), "w") as f:
+            f.write("# global agents\n")
+
+    def _harness(self, home, *args):
+        r = self.tool(home, "--harness", "cline", "--json", *args)
+        self.assertEqual(r.returncode, 0)
+        return json.loads(r.stdout)["harnesses"][0]
+
+    def test_global_before_workspace_merge_order(self):
+        root, home = self.tree({
+            ".clinerules/a.md": "# a\n",
+            "AGENTS.md": "# agents\n",
+        })
+        self._global(home)
+        h = self._harness(home, root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertEqual(paths, [
+            os.path.join(home, "Documents", "Cline", "Rules", "g.md"),
+            os.path.join(home, ".agents", "AGENTS.md"),
+            os.path.join(root, ".clinerules", "a.md"),
+            os.path.join(root, "AGENTS.md"),
+        ])
+        self.assertTrue(any("workspace rules take precedence" in n
+                            for n in h["notes"]))
+
+    def test_both_rules_dirs_combined(self):
+        root, home = self.tree({
+            ".clinerules/a.md": "# a\n",
+            ".cline/rules/b.md": "# b\n",
+        })
+        h = self._harness(home, root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertIn(os.path.join(root, ".clinerules", "a.md"), paths)
+        self.assertIn(os.path.join(root, ".cline", "rules", "b.md"), paths)
+
+    def test_txt_processed_and_other_suffixes_ignored(self):
+        root, home = self.tree({
+            ".clinerules/n.md": "# n\n",
+            ".clinerules/t.txt": "plain\n",
+            ".clinerules/x.yaml": "nope\n",
+        })
+        h = self._harness(home, root)
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertIn(os.path.join(root, ".clinerules", "n.md"), paths)
+        self.assertIn(os.path.join(root, ".clinerules", "t.txt"), paths)
+        self.assertNotIn(os.path.join(root, ".clinerules", "x.yaml"), paths)
+
+    def test_cross_tool_formats_autodetected(self):
+        root, home = self.tree({
+            ".cursorrules": "# cursor\n",
+            ".windsurfrules": "# windsurf\n",
+            "AGENTS.md": "# agents\n",
+        })
+        h = self._harness(home, root)
+        by_path = {c["path"]: c for c in h["contributors"]}
+        for name in (".cursorrules", ".windsurfrules", "AGENTS.md"):
+            p = os.path.join(root, name)
+            self.assertIn(p, by_path)
+            self.assertIn("auto-detected", by_path[p]["via"])
+
+    def test_conditional_multiline_paths(self):
+        root, home = self.tree({
+            ".clinerules/cond.md":
+                "---\npaths:\n  - src/**\n  - docs/**\n---\n# cond\n",
+        })
+        h = self._harness(home, root)
+        via = h["contributors"][0]["via"]
+        self.assertIn("conditional rule", via)
+        self.assertIn("src/**", via)
+        self.assertIn("never predicted", via)
+
+    def test_conditional_single_line_paths(self):
+        root, home = self.tree({
+            ".clinerules/cond.md": '---\npaths: ["docs/**"]\n---\n# cond\n',
+        })
+        h = self._harness(home, root)
+        via = h["contributors"][0]["via"]
+        self.assertIn("conditional rule", via)
+        self.assertIn("docs/**", via)
+
+    def test_empty_paths_never_activates(self):
+        root, home = self.tree({
+            ".clinerules/n.md": "---\npaths: []\n---\n# n\n",
+        })
+        h = self._harness(home, root)
+        self.assertIn("never activates", h["contributors"][0]["via"])
+
+    def test_no_frontmatter_always_active(self):
+        root, home = self.tree({".clinerules/a.md": "# a\n"})
+        h = self._harness(home, root)
+        self.assertIn("always active", h["contributors"][0]["via"])
+
+    def test_subdir_finds_project_root(self):
+        root, home = self.tree({
+            ".clinerules/a.md": "# a\n",
+            "sub/x.py": "x\n",
+        })
+        h = self._harness(home, os.path.join(root, "sub"))
+        paths = [c["path"] for c in h["contributors"]]
+        self.assertIn(os.path.join(root, ".clinerules", "a.md"), paths)
+        self.assertTrue(any("nearest ancestor" in n for n in h["notes"]))
+
+    def test_home_walk_stops_at_home(self):
+        # A stray ~/AGENTS.md must NOT be treated as workspace scope; only
+        # ~/.agents/AGENTS.md is a global source for Cline.
+        root, home = self.tree({})
+        with open(os.path.join(home, "AGENTS.md"), "w") as f:
+            f.write("# stray\n")
+        r = self.tool(home, "--harness", "cline", "--json", root)
+        self.assertEqual(r.returncode, 1)  # nothing loads -> exit 1
+        h = json.loads(r.stdout)["harnesses"][0]
+        self.assertEqual(h["contributors"], [])
+
+    def test_toggle_and_multiroot_notes(self):
+        root, home = self.tree({".clinerules/a.md": "# a\n"})
+        h = self._harness(home, root)
+        notes = " ".join(h["notes"])
+        self.assertIn("toggle", notes)
+        self.assertIn("primary workspace", notes)
+
+    def test_nothing_loads_exit_1(self):
+        root, home = self.tree({})
+        r = self.tool(home, "--harness", "cline", root)
+        self.assertEqual(r.returncode, 1)
+
+    def test_diff_harness_cline_cursor(self):
+        root, home = self.tree({".clinerules/a.md": "# a\n"})
+        r = self.tool(home, "--diff-harness", "cline", "cursor", "--json",
+                      root)
+        self.assertEqual(r.returncode, 0)
+        d = json.loads(r.stdout)
+        self.assertIn(os.path.join(root, ".clinerules", "a.md"),
+                      d["only_in_a"])
+
+    def test_other_modes_empty_with_honest_note(self):
+        root, home = self.tree({".clinerules/a.md": "# a\n"})
+        expected = {
+            "--mcp": "no per-directory effective set to resolve",
+            "--hooks": "no documented shell-hook mechanism",
+            "--permissions": "no documented static allow/deny",
+            "--skills": "no documented Agent Skills directory",
+        }
+        for mode, fragment in expected.items():
+            r = self.tool(home, mode, "--harness", "cline", root)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn(fragment, r.stdout)

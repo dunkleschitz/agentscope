@@ -69,6 +69,7 @@ per-harness table, 2026-10-22):
 | `cursor` | `<git-root>/.cursor/mcp.json` | `~/.cursor/mcp.json` |
 | `copilot` | `./.github/mcp.json` (nearest up the tree, inferred) | `$COPILOT_HOME/mcp-config.json` else `~/.copilot/mcp-config.json` |
 | `gemini` | `./.gemini/settings.json` `mcpServers` | `~/.gemini/settings.json` `mcpServers` |
+| `cline` | — | — | Cline's MCP servers live in the extension settings (`cline_mcp_settings.json`), not per-directory — always empty, with a note |
 
 Same-name servers defined in multiple scopes are surfaced as warnings
 (the merge order is not documented per scope); rules are tagged
@@ -113,6 +114,7 @@ Per-harness hook sources (verified via web search, 2026-10-22):
 | `cursor` | `~/.cursor/hooks.json` (global), `./.cursor/hooks.json` (project); also reads Claude's settings by default, with tool-name mapping (`Bash`→`Shell`, `Edit`→`Write`, `UserPromptSubmit`→`beforeSubmitPrompt`; `Notification`/`PermissionRequest` not mapped) |
 | `copilot` | `./.github/hooks/*.json` (repo), inline `hooks` blocks in `./.github/copilot/settings.json` + `settings.local.json` (repo) and `./.claude/settings.json` + `settings.local.json` (cross-read, documented), `~/.copilot/settings.json` (user-inline), user hooks dir (`$COPILOT_HOME/hooks` when `COPILOT_HOME` is set, else `~/.copilot/hooks/*.json`); sources merged; `disableAllHooks` honored (per-file in hook files, everything in settings.json); policy (`/etc/github-copilot/policy.d/*.json`, machine-wide) and plugin/agent-scoped hooks are not enumerable from here |
 | `gemini` | documented hook mechanism exists (geminicli.com/docs/hooks/) but is not modeled by agentscope `--hooks` — always empty, with a note pointing at `hooktest --harness gemini` |
+| `cline` | no documented shell-hook mechanism found — always empty, with a note |
 
 Exit codes in `--hooks` mode: **0** = at least one hook resolves;
 **1** = none resolve; **2** = usage error.
@@ -160,6 +162,7 @@ Per-harness permission sources (verified via web search, 2026-10-22):
 | `gemini` | `~/.gemini/settings.json` (global), `./.gemini/settings.json` (project); `tools.core` allowlist + `tools.sandbox` (also the older top-level `coreTools` shape); env vars outrank both but aren't visible to a static resolver |
 | `cursor` | no documented static allow/deny rule format found — always empty, with a note |
 | `copilot` | no documented static allow/deny rule format found — always empty, with a note |
+| `cline` | no documented static allow/deny rule format found — always empty, with a note |
 
 Exit codes in `--permissions` mode: **0** = at least one rule or
 context setting resolves; **1** = none resolve; **2** = usage error.
@@ -219,6 +222,7 @@ Per-harness skill locations (verified 2026-10-23; see
 | `gemini` | `.gemini/skills/`, `.agents/skills/` (project); `~/.gemini/skills/`, `~/.agents/skills/` (personal); interactive `activate_skill` gating noted |
 | `opencode` | six locations — `.opencode/skills/`, `.claude/skills/`, `.agents/skills/` × project (walks up to the git worktree) + global; v1: ID = frontmatter `name`; v2: ID derived from path (auto-detected from the config layout); `skills.urls` remotes listed, never fetched |
 | `antigravity` | `<workspace>/.agents/skills/` (+ legacy `.agent/skills/`); global path **conflicted** in the evidence (`~/.gemini/config/skills/` recent vs `~/.gemini/antigravity/skills/` older) — both modeled, with an explicit "verify against the docs" note |
+| `cline` | no documented Agent Skills directory found — always empty, with a note |
 
 Exit codes in `--skills` mode: **0** = at least one skill found;
 **1** = none; **2** = usage error.
@@ -234,6 +238,7 @@ Exit codes in `--skills` mode: **0** = at least one skill found;
 | `gemini` | `context.fileName` from `.gemini/settings.json` else `~/.gemini/settings.json` (default `GEMINI.md`); global `~/.gemini/GEMINI.md`; upward walk concatenated general→specific; `@file` imports inlined |
 | `opencode` | **first-match-wins per directory** (AGENTS.md shadows CLAUDE.md — not concatenated like the others); global `~/.config/opencode/AGENTS.md`; `~/.claude/CLAUDE.md` compat fallback (disabled by `OPENCODE_DISABLE_CLAUDE_CODE*`); `opencode.json` `instructions` entries (paths, globs, remote URLs — remotes listed, never fetched); **no** `@file` import expansion (the harness doesn't parse them). `--mcp` reads the v2 `mcp.servers` layout; `--permissions` reads the `permissions` array |
 | `antigravity` (v1.6.0) | **cumulative** (not replacement-based): directory-scoped rules nearest-first — `<dir>/AGENTS.md`/`GEMINI.md`, `<dir>/.agents/AGENTS.md`/`GEMINI.md`, `<dir>/.agents/rules/*.md` (frontmatter `trigger`: `always_on`/`model_decision`/`glob`/`manual`; legacy `.agent/` honored), `.agents/rules.json` `inherits`/`entries` expansion — then global `~/.gemini/AGENTS.md`, `~/.gemini/GEMINI.md`, `~/.gemini/config/AGENTS.md`/`GEMINI.md`, `~/.gemini/config/rules/*.md`. 24 KB per-file truncation warning; `@[label](path)` includes listed (inlined by the harness, not expanded here). `--hooks` reads `.agents/hooks.json` (workspace, nearest upward) + `~/.gemini/config/hooks.json` (global): 6 events, matcher regexes, `enabled: false` honored, commands shown verbatim and **never executed**. `--mcp` reads `~/.gemini/config/mcp_config.json` (+ community-reported `.agents/mcp_config.json`). `--permissions` is honestly empty — permission rules are UI-managed (Settings), with the Deny/Ask/Allow model and presets documented in notes. Rules verified 2026-10-23 vs the official docs |
+| `cline` (v1.8.0) | global `~/Documents/Cline/Rules/*.md` + `~/.agents/AGENTS.md` (baseline, loaded first), then workspace: `.clinerules/` **and** `.cline/rules/` (both searched, combined; `.md`/`.txt` processed), auto-detected `.cursorrules`, `.windsurfrules`, `AGENTS.md` at the project root. **Combined, workspace wins on conflict**; the relative order of the workspace formats is undocumented (`[inferred]`). Conditional rules: YAML frontmatter `paths` globs scope a rule to matching files — activation is dynamic (open tabs, mentioned paths, edited files), reported structurally, never predicted; `paths: []` means never activates. Rule toggles are UI state (Rules panel), not files — assumed enabled, always noted. `.clinerules/` only works in the primary workspace folder (multi-root). Workspace rules are resolved at the project root; for a subdirectory agentscope walks upward to the nearest ancestor holding rule markers (`[inferred]`, walk stops at `$HOME`). `--mcp`/`--hooks`/`--permissions`/`--skills` are honestly empty with notes (no documented per-directory static mechanism). Rules verified 2026-10-23 vs docs.cline.bot/customization/cline-rules |
 
 ## The honesty model
 
@@ -275,15 +280,15 @@ session hinges on it, confirm against the harness's own docs.
 - `--permissions` resolves the rule set on disk, not the harness's
   runtime decision: CLI flags (Codex), session-local rules (Claude
   `/permissions` changes), and environment-variable overrides (Gemini)
-  are invisible to a static resolver and flagged as notes. Cursor and
-  Copilot have no documented static allow/deny format and resolve empty.
+  are invisible to a static resolver and flagged as notes. Cursor, Copilot and
+  Cline have no documented static allow/deny format and resolve empty.
   Rule text is shown verbatim; treat the output as you would the config
   file itself.
 
 ## Testing
 
 ```bash
-python3 -m unittest test_agentscope -v   # 91 tests
+python3 -m unittest test_agentscope -v   # 140 tests
 ```
 
 Stdlib only (Python 3.11+, for `tomllib`). No dependencies. Strictly

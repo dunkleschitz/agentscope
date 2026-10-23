@@ -1,5 +1,34 @@
 # CHANGELOG — agentscope
 
+## 1.8.0 (2026-10-23)
+
+Eighth harness: `--harness cline` (Cline — VS Code/Desktop/CLI agent),
+instructions mode. Rules verified 2026-10-23 vs the official docs
+(docs.cline.bot/customization/cline-rules, page updated 2026-10-07).
+Resolution: global `~/Documents/Cline/Rules/*.md` + `~/.agents/AGENTS.md`
+(baseline, loaded first), then workspace at the project root —
+`.clinerules/` **and** `.cline/rules/` (both searched, combined;
+`.md`/`.txt` processed), auto-detected `.cursorrules`, `.windsurfrules`,
+`AGENTS.md` (cross-tool compat). Combined merge, workspace wins on
+conflict; the relative order of the workspace formats is undocumented
+(`[inferred]`). Conditional rules: the documented YAML frontmatter
+`paths` conditional is parsed (single-line and multi-line list forms)
+and reported structurally — activation depends on live editor context
+and is never predicted; `paths: []` reported as never-activates.
+Rule toggles are UI state (Rules panel), not files — assumed enabled,
+always noted. Honest notes: `.clinerules/` works only in the primary
+workspace folder (multi-root); project root = nearest ancestor of DIR
+holding rule markers (`[inferred]`, walk stops at `$HOME` so a stray
+`~/AGENTS.md` is never workspace scope); Windows global dir is
+`Documents\Cline\Rules`. `--mcp`/`--hooks`/`--permissions`/`--skills`
+resolve honestly empty with notes (no documented per-directory static
+mechanism). One real bug caught during the build by smoke test: the
+frontmatter `paths` regex used `\s*` around the value, which swallowed
+the newline and shredded multi-line lists — now `[ \t]*`. 14 new
+hermetic tests (140 total); two stale `1.7.0` version assertions in
+existing tests updated (tool correct both times). Dogfood: doccover +
+clicheck clean.
+
 ## 1.7.0 (2026-10-23)
 
 Fifth mode: `--skills` — "which skills will harness X actually SEE for

@@ -52,7 +52,7 @@ import os
 import re
 import sys
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 RULES_VERIFIED = "2026-10-22"  # date harness rules were last checked vs docs
 
 DOC = "documented"
@@ -1311,16 +1311,27 @@ def hooks_from_claude_shape(res, obj, source, scope, via):
                          timeout=entry.get("timeout"))
 
 
-def hooks_from_copilot_shape(res, obj, source, scope, via):
+def hooks_from_copilot_shape(res, obj, source, scope, via,
+                             expect_version=True):
     """Parse Copilot hook files: {"version": 1, "hooks": {event: [...]}}.
-    [documented] per awesome-copilot lifecycle-hooks guide. Command key may
-    be "bash" or "command"; timeout key "timeoutSec"."""
+    [documented] per the official GitHub Copilot hooks reference
+    (docs.github.com/en/copilot/reference/hooks-reference, verified
+    2026-10-22). Command key may be "bash", "command", or "exec"+args
+    (direct exec, no shell); timeout key "timeoutSec" ("timeout" is an
+    alias, timeoutSec wins); disableAllHooks skips the file. expect_version
+    is False for inline "hooks" blocks in settings.json, which carry no
+    version field."""
     if obj is None:
         return
     if not isinstance(obj, dict):
         res["warnings"].append("%s is not a JSON object; skipped" % source)
         return
-    if obj.get("version") != 1:
+    if obj.get("disableAllHooks") is True:
+        res["notes"].append(
+            "[documented] %s sets disableAllHooks=true — the CLI skips the "
+            "hooks declared in this file" % source)
+        return
+    if expect_version and obj.get("version") != 1:
         res["warnings"].append(
             "%s: missing or unexpected 'version' (expected 1); parsed "
             "anyway" % source)
@@ -1341,14 +1352,36 @@ def hooks_from_copilot_shape(res, obj, source, scope, via):
                     "%s event %r has a non-object hook entry; skipped"
                     % (source, event))
                 continue
-            cmd = entry.get("bash") or entry.get("command")
+            etype = entry.get("type", "command")
+            if etype != "command":
+                res["warnings"].append(
+                    "%s event %r: hook type %r is not a shell command "
+                    "(agentscope resolves shell hooks only); skipped "
+                    "[documented]" % (source, event, etype))
+                continue
+            if entry.get("exec"):
+                cmd = " ".join([str(entry["exec"])] +
+                               [str(a) for a in entry.get("args", [])])
+                note = ("direct exec, no shell interpretation "
+                        "[documented]")
+            else:
+                cmd = (entry.get("bash") or entry.get("command"))
+                note = ""
+                if entry.get("powershell") and not cmd:
+                    res["warnings"].append(
+                        "%s event %r: powershell-only entry is ignored on "
+                        "this host; skipped [documented]" % (source, event))
+                    continue
             if not cmd:
                 res["warnings"].append(
-                    "%s event %r: hook entry has neither 'bash' nor "
-                    "'command'; skipped" % (source, event))
+                    "%s event %r: hook entry has no 'bash'/'command'/'exec'; "
+                    "skipped" % (source, event))
                 continue
             add_hook(res, event, entry.get("matcher", ""), source, scope,
-                     cmd, via, timeout=entry.get("timeoutSec"))
+                     cmd, via, timeout=(entry.get("timeoutSec") if
+                                       entry.get("timeoutSec") is not None
+                                       else entry.get("timeout")),
+                     note=note)
 
 
 def hook_files_from_dir(res, dirpath, scope, via, parser, glob="*.json"):
@@ -1502,6 +1535,35 @@ def resolve_hooks_cursor(d):
     return res
 
 
+def hooks_from_copilot_settings(res, path, scope, via):
+    """Read an inline "hooks" block from a Copilot settings.json file.
+    [documented] the CLI reads top-level "hooks" in repo
+    .github/copilot/settings.json and settings.local.json, in
+    .claude/settings.json and settings.local.json (cross-tool read), and
+    in user ~/.copilot/settings.json. disableAllHooks at this level skips
+    every hook from every source for sessions here."""
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError) as e:
+        res["warnings"].append("%s is not valid JSON (%s); skipped"
+                              % (path, e))
+        return
+    if not isinstance(settings, dict):
+        res["warnings"].append("%s is not a JSON object; skipped" % path)
+        return
+    if settings.get("disableAllHooks") is True:
+        res["notes"].append(
+            "[documented] %s sets disableAllHooks=true — the CLI skips "
+            "every hook from every source for sessions here (policy "
+            "hooks are not affected)" % path)
+        return
+    hooks_from_copilot_shape(res, {"hooks": settings.get("hooks")}, path,
+                             scope, via, expect_version=False)
+
+
 def resolve_hooks_copilot(d):
     res = new_hook_resolution("copilot")
     h = home()
@@ -1521,15 +1583,44 @@ def resolve_hooks_copilot(d):
     if not found:
         res["notes"].append(
             "[documented] no .github/hooks/ dir here, so no repo-scope hooks")
+    # inline "hooks" blocks in settings files [documented]
+    copilot_home = os.environ.get("COPILOT_HOME")
+    user_hooks_dir = (os.path.join(copilot_home, "hooks")
+                      if copilot_home else os.path.join(h, ".copilot", "hooks"))
+    via_inline = ("[documented] inline 'hooks' block in %s; event entries "
+                  "use the same shape as hook files (no version field)")
+    for rel in (os.path.join(".github", "copilot", "settings.json"),
+                os.path.join(".github", "copilot", "settings.local.json")):
+        hooks_from_copilot_settings(res, os.path.join(root, rel), "repo",
+                                    via_inline % rel)
+    for rel in (os.path.join(".claude", "settings.json"),
+                os.path.join(".claude", "settings.local.json")):
+        hooks_from_copilot_settings(res, os.path.join(root, rel),
+                                    "repo-inline",
+                                    "[documented] the CLI cross-reads "
+                                    ".claude/settings*.json for inline "
+                                    "'hooks' blocks, same as its own "
+                                    "settings.json")
+    hooks_from_copilot_settings(res, os.path.join(h, ".copilot",
+                                                 "settings.json"),
+                                "user-inline",
+                                via_inline % "~/.copilot/settings.json")
     hook_files_from_dir(
-        res, os.path.join(h, ".copilot", "hooks"), "user",
-        "[documented] ~/.copilot/hooks/*.json = user scope",
+        res, user_hooks_dir, "user",
+        "[documented] user hooks dir (%s)" %
+        ("$COPILOT_HOME/hooks when COPILOT_HOME is set, else "
+         "~/.copilot/hooks/*.json = user scope"),
         hooks_from_copilot_shape)
     res["notes"].append(
-        "[documented] hook sources are merged (policy > user > repo > "
-        "plugin); policy hooks are machine-wide and not enumerable from "
-        "here; plugin-declared hooks are not enumerated here; "
-        "end users cannot disable policy hooks")
+        "[documented] hook sources merge in order policy > user > repo > "
+        "plugin; when the same event appears in multiple sources, ALL "
+        "entries run. Policy hooks are machine-wide and not enumerable "
+        "from here — Linux/macOS: /etc/github-copilot/policy.d/*.json "
+        "(root-owned, not group/world-writable), Windows: "
+        "HKLM\\Software\\Policies\\GitHub\\Copilot. Plugin-declared hooks "
+        "(each plugin's own hooks.json) and custom-agent frontmatter "
+        "scoped hooks are not enumerated here; end users cannot disable "
+        "policy hooks")
     return res
 
 

@@ -109,8 +109,8 @@ Per-harness hook sources (verified via web search, 2026-10-22):
 | `claude` | `~/.claude/settings.json` (user), `./.claude/settings.json` (project), `./.claude/settings.local.json` (personal); matchers are regexes on tool names; all scopes fire; hooks load at session start |
 | `codex` | `~/.codex/hooks.json` (global), `./.codex/hooks.json` or `[hooks]` in `./.codex/config.toml` (project, trusted projects only); borrows Claude's config shape; blocking = exit 2 or `permissionDecision` deny |
 | `cursor` | `~/.cursor/hooks.json` (global), `./.cursor/hooks.json` (project); also reads Claude's settings by default, with tool-name mapping (`Bash`→`Shell`, `Edit`→`Write`, `UserPromptSubmit`→`beforeSubmitPrompt`; `Notification`/`PermissionRequest` not mapped) |
-| `copilot` | `./.github/hooks/*.json` (repo), `~/.copilot/hooks/*.json` (user); sources merged; policy (machine-wide) and plugin-declared hooks are not enumerable from here |
-| `gemini` | no documented hook mechanism — always empty, with a note |
+| `copilot` | `./.github/hooks/*.json` (repo), inline `hooks` blocks in `./.github/copilot/settings.json` + `settings.local.json` (repo) and `./.claude/settings.json` + `settings.local.json` (cross-read, documented), `~/.copilot/settings.json` (user-inline), user hooks dir (`$COPILOT_HOME/hooks` when `COPILOT_HOME` is set, else `~/.copilot/hooks/*.json`); sources merged; `disableAllHooks` honored (per-file in hook files, everything in settings.json); policy (`/etc/github-copilot/policy.d/*.json`, machine-wide) and plugin/agent-scoped hooks are not enumerable from here |
+| `gemini` | documented hook mechanism exists (geminicli.com/docs/hooks/) but is not modeled by agentscope `--hooks` — always empty, with a note pointing at `hooktest --harness gemini` |
 
 Exit codes in `--hooks` mode: **0** = at least one hook resolves;
 **1** = none resolve; **2** = usage error.

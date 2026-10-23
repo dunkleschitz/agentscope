@@ -293,7 +293,7 @@ class CliTests(Base):
         root, home = self.tree({})
         r = self.tool(home, "--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("1.4.0", r.stdout)
+        self.assertIn("1.5.0", r.stdout)
         r = self.tool(home, "--list-harnesses")
         for h in ("codex", "claude", "cursor", "copilot", "gemini", "opencode"):
             self.assertIn(h, r.stdout)
@@ -676,8 +676,127 @@ class HooksTests(Base):
         self.assertEqual(repo["timeout"], 60)
         self.assertTrue(any("version" in w for w in
                             full["harnesses"][0]["warnings"]))
-        self.assertTrue(any("merged" in n for n in
-                            full["harnesses"][0]["notes"]))
+    def test_copilot_inline_settings_hooks(self):
+        # the official GitHub Copilot hooks reference documents inline
+        # "hooks" blocks in settings.json (repo copilot settings, user
+        # copilot settings, and a cross-tool read of .claude/settings.json)
+        root, home = self.tree({
+            ".git": None,
+            ".github/copilot/settings.json": json.dumps({
+                "hooks": {"sessionStart": [
+                    {"command": "./scripts/init.sh"}]}}),
+            ".github/copilot/settings.local.json": json.dumps({
+                "hooks": {"preToolUse": [
+                    {"matcher": "^bash$", "bash": "deny.sh"}]}}),
+            ".claude/settings.json": json.dumps({
+                "hooks": {"userPromptSubmitted": [
+                    {"command": "log.sh"}]}}),
+        })
+        os.makedirs(os.path.join(home, ".copilot"), exist_ok=True)
+        with open(os.path.join(home, ".copilot", "settings.json"), "w") as f:
+            f.write(json.dumps({"hooks": {"sessionEnd": [
+                {"bash": "bye.sh", "timeout": 45}]}}))  # timeout alias
+        hks, full = self.hooks_json(root, home, "--harness", "copilot")
+        cp = hks["copilot"]
+        by_scope = {h["scope"] for h in cp}
+        self.assertEqual(by_scope, {"repo", "repo-inline", "user-inline"})
+        inline = [h for h in cp if h["scope"] == "repo"][0]
+        self.assertEqual(inline["event"], "sessionStart")
+        self.assertEqual(inline["command"], "./scripts/init.sh")
+        local_inline = [h for h in cp if h["matcher"] == "^bash$"][0]
+        self.assertEqual(local_inline["scope"], "repo")
+        claude_x = [h for h in cp if h["scope"] == "repo-inline"][0]
+        self.assertEqual(claude_x["event"], "userPromptSubmitted")
+        user_inline = [h for h in cp if h["scope"] == "user-inline"][0]
+        self.assertEqual(user_inline["event"], "sessionEnd")
+        self.assertEqual(user_inline["timeout"], 45)  # timeout alias honored
+        # inline blocks carry no version field: no version warnings allowed
+        self.assertFalse(any("version" in w for w in
+                             full["harnesses"][0]["warnings"]))
+
+    def test_copilot_disable_all_hooks_settings(self):
+        # disableAllHooks at settings.json level skips every hook
+        root, home = self.tree({
+            ".git": None,
+            ".github/copilot/settings.json": json.dumps({
+                "disableAllHooks": True,
+                "hooks": {"sessionStart": [{"command": "x.sh"}]}}),
+            ".github/hooks/a.json": json.dumps({
+                "version": 1,
+                "hooks": {"sessionStart": [{"command": "y.sh"}]}}),
+        })
+        hks, full = self.hooks_json(root, home, "--harness", "copilot")
+        cp = hks["copilot"]
+        self.assertFalse(any(h["scope"] == "repo-inline" for h in cp))
+        self.assertTrue(any("disableAllHooks=true" in n
+                            and "every hook" in n
+                            for n in full["harnesses"][0]["notes"]))
+
+    def test_copilot_disable_all_hooks_single_file(self):
+        # disableAllHooks in one hooks-dir file skips only that file
+        root, home = self.tree({
+            ".git": None,
+            ".github/hooks/off.json": json.dumps({
+                "version": 1, "disableAllHooks": True,
+                "hooks": {"sessionStart": [{"command": "x.sh"}]}}),
+            ".github/hooks/on.json": json.dumps({
+                "version": 1,
+                "hooks": {"sessionStart": [{"command": "y.sh"}]}}),
+        })
+        hks, full = self.hooks_json(root, home, "--harness", "copilot")
+        cp = hks["copilot"]
+        self.assertEqual([h["command"] for h in cp], ["y.sh"])
+        self.assertTrue(any("disableAllHooks=true" in n
+                            for n in full["harnesses"][0]["notes"]))
+
+    def test_copilot_exec_form_and_http_skipped(self):
+        # "exec"+args runs the executable directly, no shell; "http" hooks
+        # are not shell commands and are skipped with a warning
+        root, home = self.tree({
+            ".git": None,
+            ".github/hooks/x.json": json.dumps({
+                "version": 1,
+                "hooks": {
+                    "preToolUse": [
+                        {"exec": "python3", "args": ["guard.py", "--fast"],
+                         "matcher": "^bash$"}],
+                    "sessionStart": [
+                        {"type": "http", "url": "https://example.com/hook"}],
+                    "sessionEnd": [
+                        {"powershell": "bye.ps1"}]}}),
+        })
+        hks, full = self.hooks_json(root, home, "--harness", "copilot")
+        cp = hks["copilot"]
+        self.assertEqual(len(cp), 1)
+        self.assertEqual(cp[0]["command"], "python3 guard.py --fast")
+        self.assertIn("no shell", cp[0]["note"])
+        warns = full["harnesses"][0]["warnings"]
+        self.assertTrue(any("http" in w and "not a shell command" in w
+                            for w in warns))
+        self.assertTrue(any("powershell-only" in w for w in warns))
+
+    def test_copilot_home_env_redirects_user_hooks(self):
+        # COPILOT_HOME set -> user hooks live in $COPILOT_HOME/hooks
+        root, home = self.tree({".git": None})
+        chome = tempfile.mkdtemp(prefix="as-chome-")
+        self._tmp.append(chome)
+        os.makedirs(os.path.join(chome, "hooks"))
+        with open(os.path.join(chome, "hooks", "u.json"), "w") as f:
+            f.write(json.dumps({"version": 1, "hooks": {"sessionStart": [
+                {"command": "chome.sh"}]}}))
+        env = dict(os.environ, HOME=home, COPILOT_HOME=chome)
+        r = subprocess.run([sys.executable, TOOL, "--hooks", "--json",
+                            "--harness", "copilot", root],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0)
+        cp = json.loads(r.stdout)["harnesses"][0]["hooks"]
+        self.assertEqual(len(cp), 1)
+        self.assertEqual(cp[0]["command"], "chome.sh")
+        self.assertEqual(cp[0]["scope"], "user")
+        self.assertIn("COPILOT_HOME", cp[0]["via"])
+        notes = json.loads(r.stdout)["harnesses"][0]["notes"]
+        self.assertTrue(any("/etc/github-copilot/policy.d" in n
+                            for n in notes))
 
     def test_gemini_hooks_documented_not_modeled(self):
         # the stale v1.2.0 note said no hook mechanism existed; the Gemini
@@ -731,7 +850,7 @@ class HooksTests(Base):
         r = self.tool(home, "--hooks", "--harness", "claude", "--json", root)
         body = json.loads(r.stdout)
         self.assertEqual(body["mode"], "hooks")
-        self.assertEqual(body["version"], "1.4.0")
+        self.assertEqual(body["version"], "1.5.0")
         self.assertIn("never executed", body["disclaimer"])
         hk = body["harnesses"][0]["hooks"][0]
         for k in ("event", "matcher", "source", "scope", "command",

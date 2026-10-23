@@ -1,6 +1,39 @@
 # CHANGELOG — agentscope
 
-## 1.4.0 (2026-10-22)
+## 1.5.0 (2026-10-22)
+
+Copilot `--hooks` resolution upgraded against the official GitHub Copilot
+hooks reference (docs.github.com/en/copilot/reference/hooks-reference,
+verified 2026-10-22 — the same reference backing hooktest's new
+`--harness copilot` corpus):
+
+- Inline `hooks` blocks in settings files are now enumerated: repo
+  `.github/copilot/settings.json` + `settings.local.json` (scope `repo`),
+  cross-tool-read `.claude/settings.json` + `settings.local.json`
+  (scope `repo-inline`, all `[documented]`), and user
+  `~/.copilot/settings.json` (scope `user-inline`). These are hooks the
+  previous version silently missed.
+- Entry parsing now handles the documented `exec` + `args` form (direct
+  exec, no shell — recorded verbatim with a note), the `timeout` alias
+  (`timeoutSec` wins when both are present), and non-`command` hook types
+  (e.g. `http` hooks are skipped with a warning: agentscope resolves
+  shell hooks only).
+- `disableAllHooks` is honored: in a hooks-dir file it skips that file's
+  hooks (note); at settings.json level it produces the documented
+  stronger note — the CLI skips every hook from every source for sessions
+  here (policy hooks excepted).
+- `COPILOT_HOME` is honored: user hooks load from `$COPILOT_HOME/hooks`
+  when set, else `~/.copilot/hooks` `[documented]`.
+- Merge note now records the documented source order (policy > user >
+  repo > plugin), the policy paths (`/etc/github-copilot/policy.d/*.json`
+  on Linux/macOS, `HKLM\Software\Policies\GitHub\Copilot` on Windows —
+  machine-wide, not enumerable from here), and the plugin/agent-scoped
+  sources that stay unmodeled.
+- Also fixed a README gap: the hooks-source table still claimed Gemini
+  CLI had no documented hook mechanism (corrected in the tool in v1.4.0,
+  but the README row was left behind) — now reads
+  documented-but-not-modeled, pointing at `hooktest --harness gemini`.
+- 90+ tests passing (5 new copilot `--hooks` tests).
 
 Sixth harness: `--harness opencode` (instructions mode). Resolves the
 effective instruction set for OpenCode from vendor docs verified

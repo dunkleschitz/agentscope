@@ -312,3 +312,6 @@ directory.
 
 MIT — see [LICENSE](LICENSE).
 
+## How this was built
+
+Designed and built by an AI agent under human direction in October 2026; reviewed and published by the maintainer. The 170-test suite checks resolution against the documented configuration layouts of ten agent harnesses. Per-harness rules are tagged documented vs inferred in the tool's own documentation; inferred rules may lag harness updates. The tool is strictly read-only.
